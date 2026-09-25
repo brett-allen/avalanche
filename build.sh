@@ -12,6 +12,7 @@ test)
 	odin build tools/bencode_smoke \
 		-out:build/bencode_smoke \
 		-collection:avalanche=src \
+		-collection:deps=vendor \
 		"$@"
 	./build/bencode_smoke
 	;;
@@ -19,6 +20,7 @@ test)
 	odin build src/app \
 		-out:avalanche \
 		-collection:avalanche=src \
+		-collection:deps=vendor \
 		"$@"
 	;;
 esac

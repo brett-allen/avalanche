@@ -15,7 +15,7 @@ main :: proc() {
 
 	cmd, ok := parse_command(opt.command)
 	if !ok {
-		fmt.eprintfln("Error: invalid command %q. Expected one of: version, info, download.", opt.command)
+		fmt.eprintfln("Error: invalid command %q. Expected one of: version, info, download, serve.", opt.command)
 		usage()
 		os.exit(1)
 	}
@@ -31,5 +31,7 @@ main :: proc() {
 		run_info(opt)
 	case .Download:
 		run_download(opt)
+	case .Serve:
+		run_serve(opt)
 	}
 }

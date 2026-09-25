@@ -1,5 +1,6 @@
 {
   "collections": [
-    {"name": "avalanche", "path": "./src"}
+    {"name": "avalanche", "path": "./src"},
+    {"name": "deps", "path": "./vendor"}
   ]
 }
