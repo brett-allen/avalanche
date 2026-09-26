@@ -634,6 +634,17 @@ torrent_worker :: proc(th: ^thread.Thread) {
 
 	torrent_set_state(t, .Announcing)
 
+	listener, lerr := peer.listen_peers(e.client.listen_port, alloc)
+	if lerr.kind != .None {
+		if lerr.message != "" {
+			delete(lerr.message, alloc)
+		}
+		listener = 0
+	}
+	defer if listener != 0 {
+		net.close(listener)
+	}
+
 	peers, _ := collect_swarm(e.client, t.magnet, alloc)
 	defer delete(peers)
 
@@ -642,8 +653,8 @@ torrent_worker :: proc(th: ^thread.Thread) {
 		return
 	}
 
-	if len(peers) == 0 {
-		torrent_set_state(t, .Failed, "no peers from trackers")
+	if len(peers) == 0 && listener == 0 {
+		torrent_set_state(t, .Failed, "no peers from trackers or DHT")
 		return
 	}
 
@@ -652,12 +663,14 @@ torrent_worker :: proc(th: ^thread.Thread) {
 		meta     = t.meta,
 		has_meta = t.has_meta,
 	}
-	if merr := ensure_metadata(e.client, &view, peers[:], alloc); merr.kind != .None {
-		msg := error_string(merr)
+	if merr := ensure_metadata(e.client, &view, peers[:], alloc, listener); merr.kind != .None {
+		// Clone before free — error_string may alias merr.message.
+		msg := strings.clone(error_string(merr), alloc)
 		if merr.message != "" {
 			delete(merr.message, alloc)
 		}
 		torrent_set_state(t, .Failed, msg)
+		delete(msg, alloc)
 		return
 	}
 	t.meta = view.meta

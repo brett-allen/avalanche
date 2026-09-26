@@ -38,10 +38,12 @@ extended_destroy :: proc(ext: ^Extended_Handshake, allocator := context.allocato
 encode_extended_handshake :: proc(port: u16, allocator := context.allocator) -> (data: []byte, err: Error) {
 	m := make(bencode.Dict, allocator)
 	m[strings.clone(UT_METADATA, allocator)] = i64(UT_METADATA_LOCAL_ID)
+	m[strings.clone(UT_PEX, allocator)] = i64(2)
 
 	root := make(bencode.Dict, allocator)
 	root[strings.clone("m", allocator)] = m
 	root[strings.clone("v", allocator)] = strings.clone(CLIENT_VERSION, allocator)
+	root[strings.clone("metadata_size", allocator)] = i64(0)
 	if port != 0 {
 		root[strings.clone("p", allocator)] = i64(port)
 	}
