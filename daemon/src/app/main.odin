@@ -2,6 +2,7 @@ package main
 
 import "core:flags"
 import "core:fmt"
+import "core:log"
 import "core:os"
 
 main :: proc() {
@@ -20,6 +21,9 @@ main :: proc() {
 	if !validate(opt, cmd) {
 		os.exit(1)
 	}
+
+	setup_logging(opt.verbose)
+	defer log.destroy_console_logger(context.logger)
 
 	switch cmd {
 	case .Version:

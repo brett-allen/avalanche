@@ -4,6 +4,7 @@
 package session
 
 import "core:crypto"
+import "core:log"
 import "avalanche:dht"
 import "avalanche:metainfo"
 import "avalanche:tracker"
@@ -55,8 +56,12 @@ client_make :: proc(port: u16 = DEFAULT_PORT) -> Client {
 	node, derr := dht.node_make(listen)
 	if derr.kind == .None {
 		client.dht = node
-	} else if derr.message != "" {
-		delete(derr.message)
+		log.infof("dht: listening on udp/%d", int(node.port))
+	} else {
+		log.warnf("dht: disabled (%s)", derr.message if derr.message != "" else "init failed")
+		if derr.message != "" {
+			delete(derr.message)
+		}
 	}
 	return client
 }

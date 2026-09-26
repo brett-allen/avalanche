@@ -127,7 +127,10 @@ listen_and_serve :: proc(eng: ^session.Engine, cfg: Server_Config) -> net.Networ
 	g_engine = eng
 	g_output = cfg.output if cfg.output != "" else "downloads"
 
-	context.logger = log.create_console_logger(.Info)
+	// Prefer logger from main; only install a fallback if none is set.
+	if context.logger.procedure == nil {
+		context.logger = log.create_console_logger(.Info)
+	}
 
 	s: http.Server
 	http.server_shutdown_on_interrupt(&s)

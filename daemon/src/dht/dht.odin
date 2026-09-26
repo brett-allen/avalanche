@@ -4,6 +4,7 @@
 package dht
 
 import "core:crypto"
+import "core:log"
 import "core:mem"
 import "core:net"
 import "core:strings"
@@ -195,6 +196,7 @@ bootstrap :: proc(node: ^Node, allocator := context.allocator) -> Error {
 	if !node.bootstrapped {
 		return dht_fail(.Network, "DHT bootstrap found no nodes", allocator)
 	}
+	log.infof("dht: bootstrap ok nodes=%d udp/%d", routing_count(&node.table), int(node.port))
 	return {}
 }
 
@@ -233,5 +235,6 @@ get_peers :: proc(
 		delete(h.token, allocator)
 	}
 	delete(tokens, allocator)
+	log.debugf("dht: announced to %d nodes, peers=%d", announced, len(found))
 	return found, {}
 }
