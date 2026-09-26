@@ -5,13 +5,10 @@ import "core:fmt"
 import "core:os"
 
 main :: proc() {
-	if len(os.args) < 2 {
-		usage()
-		os.exit(1)
-	}
-
 	opt: Options
-	flags.parse_or_exit(&opt, os.args, .Unix)
+	if len(os.args) >= 2 {
+		flags.parse_or_exit(&opt, os.args, .Unix)
+	}
 
 	cmd, ok := parse_command(opt.command)
 	if !ok {

@@ -14,7 +14,7 @@ run_serve :: proc(opt: Options) {
 	eng := session.engine_make(bt_port)
 	defer session.engine_destroy(eng)
 
-	fmt.printfln("avalanche serve")
+	fmt.printfln("avalanched")
 	fmt.printfln("  peer listen  %d", int(bt_port))
 	fmt.printfln("  api          http://127.0.0.1:%d", int(api_port))
 	fmt.printfln("  output       %s", out)

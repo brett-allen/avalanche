@@ -14,7 +14,7 @@ Command :: enum {
 }
 
 Options :: struct {
-	command: string `args:"pos=0,required" usage:"Command: version | info | download | serve"`,
+	command: string `args:"pos=0" usage:"Command: version | info | download | serve (default)"`,
 	input:   string `args:"pos=1" usage:"Path to .torrent or magnet URI"`,
 	output:      string `usage:"Download directory"`,
 	port:        u16    `usage:"BitTorrent listen port (default 6881)"`,
@@ -24,6 +24,9 @@ Options :: struct {
 }
 
 parse_command :: proc(cmd: string) -> (Command, bool) {
+	if cmd == "" {
+		return .Serve, true
+	}
 	v, _ := strings.to_lower(cmd)
 	switch v {
 	case "version", "-v", "--version":
@@ -57,12 +60,13 @@ listen_port :: proc(opt: Options) -> u16 {
 
 usage :: proc() {
 	fmt.eprintf(
-		"Usage: %s <command> [input] [flags]\n\n" +
+		"Usage: %s [command] [input] [flags]\n\n" +
+		"With no command, starts the HTTP control-plane daemon.\n\n" +
 		"Commands:\n" +
 		"  version              Print Avalanche and libcurl versions\n" +
 		"  info <torrent>       Inspect a .torrent or magnet URI\n" +
 		"  download <t>…        Download one or more magnets/.torrent files\n" +
-		"  serve                Run local HTTP control-plane API\n\n" +
+		"  serve                Run local HTTP control-plane API (default)\n\n" +
 		"Flags:\n" +
 		"  --output <dir>       Download directory\n" +
 		"  --port <n>           BitTorrent listen port (default %d)\n" +
