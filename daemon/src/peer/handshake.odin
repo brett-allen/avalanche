@@ -10,6 +10,10 @@ PROTOCOL_LEN   :: 19
 EXTENSION_RESERVED_BYTE :: 5
 EXTENSION_RESERVED_BIT  :: u8(0x10)
 
+// BEP 5: last bit of the reserved string marks DHT support.
+DHT_RESERVED_BYTE :: 7
+DHT_RESERVED_BIT  :: u8(0x01)
+
 encode_handshake :: proc(hs: Handshake, allocator := context.allocator) -> (data: []byte, err: Error) {
 	if len(PROTOCOL) != PROTOCOL_LEN {
 		return nil, peer_fail(.Invalid, "internal protocol length mismatch", allocator)
@@ -46,6 +50,7 @@ make_handshake :: proc(info_hash, peer_id: [20]u8) -> (hs: Handshake) {
 	hs.info_hash = info_hash
 	hs.peer_id = peer_id
 	set_extension(&hs)
+	set_dht(&hs)
 	return
 }
 
@@ -55,6 +60,14 @@ set_extension :: proc(hs: ^Handshake) {
 
 has_extension :: proc(hs: Handshake) -> bool {
 	return hs.reserved[EXTENSION_RESERVED_BYTE] & EXTENSION_RESERVED_BIT != 0
+}
+
+set_dht :: proc(hs: ^Handshake) {
+	hs.reserved[DHT_RESERVED_BYTE] |= DHT_RESERVED_BIT
+}
+
+has_dht :: proc(hs: Handshake) -> bool {
+	return hs.reserved[DHT_RESERVED_BYTE] & DHT_RESERVED_BIT != 0
 }
 
 peer_id_hex :: proc(id: [20]u8, allocator := context.allocator) -> string {

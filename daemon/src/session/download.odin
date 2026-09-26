@@ -2,13 +2,16 @@ package session
 
 import "core:net"
 import "core:strings"
+import "core:time"
+import "avalanche:dht"
 import "avalanche:metainfo"
 import "avalanche:peer"
 import "avalanche:storage"
 import "avalanche:tracker"
 
 MAX_ANNOUNCE_PEERS :: 200
-MAX_METADATA_PEERS :: 12
+MAX_METADATA_PEERS :: 64
+METADATA_DIAL_TIMEOUT :: 3 * time.Second
 
 Download_Result :: struct {
 	pieces: int,
@@ -19,6 +22,17 @@ session_fail :: proc(kind: Error_Kind, msg: string, allocator := context.allocat
 	return Error{kind = kind, message = strings.clone(msg, allocator)}
 }
 
+@(private)
+append_unique_peer :: proc(peers: ^[dynamic]tracker.Peer_Addr, ep: net.Endpoint) -> bool {
+	for have in peers {
+		if have.endpoint == ep {
+			return false
+		}
+	}
+	append(peers, tracker.Peer_Addr{endpoint = ep})
+	return true
+}
+
 collect_swarm :: proc(
 	client: Client,
 	magnet: metainfo.Magnet,
@@ -27,8 +41,14 @@ collect_swarm :: proc(
 	peers: [dynamic]tracker.Peer_Addr,
 	err: Error,
 ) {
+	peers = make([dynamic]tracker.Peer_Addr, 0, 64, allocator)
+
+	// Trackers first — usually returns something within a few seconds.
 	req := announce_request(client, magnet)
 	for url in magnet.trackers {
+		if len(peers) >= MAX_ANNOUNCE_PEERS {
+			break
+		}
 		if !tracker.is_udp_tracker(url) && !tracker.is_http_tracker(url) {
 			continue
 		}
@@ -40,22 +60,31 @@ collect_swarm :: proc(
 			continue
 		}
 		for p in res.peers {
-			exists := false
-			for have in peers {
-				if have.endpoint == p.endpoint {
-					exists = true
-					break
-				}
-			}
-			if !exists {
-				append(&peers, p)
-				if len(peers) >= MAX_ANNOUNCE_PEERS {
-					tracker.announce_destroy(&res)
-					return peers, {}
-				}
+			_ = append_unique_peer(&peers, p.endpoint)
+			if len(peers) >= MAX_ANNOUNCE_PEERS {
+				break
 			}
 		}
 		tracker.announce_destroy(&res)
+	}
+
+	// DHT fills in dialable peers trackers miss (esp. for magnets).
+	if client.dht != nil && len(peers) < MAX_ANNOUNCE_PEERS {
+		info_hash := dht.Node_ID(magnet.info_hash)
+		dht_peers, derr := dht.get_peers(client.dht, info_hash, allocator)
+		if derr.kind != .None {
+			if derr.message != "" {
+				delete(derr.message, allocator)
+			}
+		} else {
+			for ep in dht_peers {
+				_ = append_unique_peer(&peers, ep)
+				if len(peers) >= MAX_ANNOUNCE_PEERS {
+					break
+				}
+			}
+			delete(dht_peers, allocator)
+		}
 	}
 	return peers, {}
 }
@@ -65,25 +94,109 @@ ensure_metadata :: proc(
 	tor: ^Torrent_Session,
 	peers: []tracker.Peer_Addr,
 	allocator := context.allocator,
+	listener: net.TCP_Socket = 0,
 ) -> Error {
 	if tor.has_meta {
 		return {}
 	}
+	if len(peers) == 0 && listener == 0 {
+		return session_fail(.Invalid, "could not fetch torrent metadata from peers", allocator)
+	}
+
 	local := peer.make_handshake(transmute([20]u8)tor.magnet.info_hash, client.peer_id)
-	tried := 0
+	want_hash := transmute([20]u8)tor.magnet.info_hash
+
+	endpoints := make([dynamic]net.Endpoint, 0, max(len(peers), 1), allocator)
+	defer delete(endpoints)
 	for p in peers {
-		if tried >= MAX_METADATA_PEERS {
-			break
+		append(&endpoints, p.endpoint)
+	}
+
+	owns_listener := false
+	listen_sock := listener
+	if listen_sock == 0 {
+		created, lerr := peer.listen_peers(client.listen_port, allocator)
+		if lerr.kind == .None {
+			listen_sock = created
+			owns_listener = true
+		} else if lerr.message != "" {
+			delete(lerr.message, allocator)
 		}
+	}
+	defer if owns_listener && listen_sock != 0 {
+		net.close(listen_sock)
+	}
+
+	tried := 0
+	next := 0
+	for tried < MAX_METADATA_PEERS {
+		// Prefer outbound dials; occasionally accept inbound.
+		if listen_sock != 0 && (next >= len(endpoints) || tried % 4 == 3) {
+			ps, raw, aerr := peer.accept_session(
+				listen_sock,
+				local,
+				client.listen_port,
+				true,
+				want_hash,
+				1 * time.Second,
+				allocator,
+			)
+			if aerr.kind != .None {
+				if aerr.message != "" {
+					delete(aerr.message, allocator)
+				}
+				peer.peer_session_destroy(&ps, allocator)
+			} else {
+				tried += 1
+				if len(raw) > 0 {
+					info, ih, ierr := metainfo.parse_info(raw, allocator)
+					delete(raw, allocator)
+					peer.peer_session_destroy(&ps, allocator)
+					if ierr.kind == .None && ih == tor.magnet.info_hash {
+						tor.meta.info = info
+						tor.meta.info_hash = ih
+						tor.has_meta = true
+						return {}
+					}
+					if ierr.kind == .None {
+						metainfo.info_destroy(&info, allocator)
+					}
+					continue
+				}
+				for ep in ps.pex {
+					exists := false
+					for have in endpoints {
+						if have == ep {
+							exists = true
+							break
+						}
+					}
+					if !exists {
+						append(&endpoints, ep)
+					}
+				}
+				peer.peer_session_destroy(&ps, allocator)
+			}
+		}
+
+		if next >= len(endpoints) {
+			if listen_sock == 0 {
+				break
+			}
+			continue
+		}
+
+		ep := endpoints[next]
+		next += 1
 		tried += 1
-		ps, raw, err := peer.connect_session(
-			p.endpoint,
+
+		ps, raw, pex, err := peer.connect_session_pex(
+			ep,
 			local,
-			0,
 			client.listen_port,
 			true,
-			transmute([20]u8)tor.magnet.info_hash,
-			peer.HANDSHAKE_TIMEOUT,
+			want_hash,
+			METADATA_DIAL_TIMEOUT,
 			allocator,
 		)
 		if err.kind != .None {
@@ -93,13 +206,25 @@ ensure_metadata :: proc(
 			peer.peer_session_destroy(&ps, allocator)
 			continue
 		}
+		for ep2 in pex {
+			exists := false
+			for have in endpoints {
+				if have == ep2 {
+					exists = true
+					break
+				}
+			}
+			if !exists {
+				append(&endpoints, ep2)
+			}
+		}
+		delete(pex, allocator)
+		peer.peer_session_destroy(&ps, allocator)
 		if len(raw) == 0 {
-			peer.peer_session_destroy(&ps, allocator)
 			continue
 		}
 		info, ih, ierr := metainfo.parse_info(raw, allocator)
 		delete(raw, allocator)
-		peer.peer_session_destroy(&ps, allocator)
 		if ierr.kind != .None {
 			continue
 		}
@@ -135,7 +260,7 @@ download :: proc(
 	defer delete(peers)
 	_ = perr
 	if len(peers) == 0 {
-		return {}, session_fail(.Invalid, "no peers from trackers", allocator)
+		return {}, session_fail(.Invalid, "no peers from trackers or DHT", allocator)
 	}
 
 	if merr := ensure_metadata(client^, tor, peers[:], allocator); merr.kind != .None {

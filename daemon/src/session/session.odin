@@ -4,6 +4,7 @@
 package session
 
 import "core:crypto"
+import "avalanche:dht"
 import "avalanche:metainfo"
 import "avalanche:tracker"
 
@@ -24,6 +25,7 @@ Error :: struct {
 Client :: struct {
 	peer_id:     [20]u8,
 	listen_port: u16,
+	dht:         ^dht.Node,
 }
 
 Torrent_Session :: struct {
@@ -45,15 +47,27 @@ error_string :: proc(err: Error) -> string {
 }
 
 client_make :: proc(port: u16 = DEFAULT_PORT) -> Client {
-	return Client{
+	listen := port if port != 0 else DEFAULT_PORT
+	client := Client{
 		peer_id     = make_peer_id(),
-		listen_port = port if port != 0 else DEFAULT_PORT,
+		listen_port = listen,
 	}
+	node, derr := dht.node_make(listen)
+	if derr.kind == .None {
+		client.dht = node
+	} else if derr.message != "" {
+		delete(derr.message)
+	}
+	return client
 }
 
 destroy :: proc(client: ^Client) {
 	if client == nil {
 		return
+	}
+	if client.dht != nil {
+		dht.node_destroy(client.dht)
+		client.dht = nil
 	}
 	client^ = {}
 }
@@ -115,9 +129,10 @@ add_magnet :: proc(client: ^Client, uri: string, allocator := context.allocator)
 }
 
 announce_request :: proc(client: Client, magnet: metainfo.Magnet) -> tracker.Announce_Request {
+	// Unknown size must NOT announce left=0 (that claims we're a seed).
 	left := magnet.exact_length
 	if left <= 0 {
-		left = 0
+		left = 1 << 40
 	}
 	return tracker.Announce_Request{
 		info_hash  = magnet.info_hash,

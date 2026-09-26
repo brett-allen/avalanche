@@ -55,6 +55,7 @@ Peer_Session :: struct {
 	bitfield:      Bitfield,
 	peer_choking:  bool,
 	am_interested: bool,
+	pex:           [dynamic]net.Endpoint,
 }
 
 @(private)
@@ -96,6 +97,7 @@ peer_session_destroy :: proc(ps: ^Peer_Session, allocator := context.allocator) 
 	}
 	extended_destroy(&ps.extended, allocator)
 	bitfield_destroy(&ps.bitfield, allocator)
+	delete(ps.pex)
 	ps^ = {}
 }
 
@@ -119,6 +121,7 @@ connect_session :: proc(
 	}
 	ps.sock = sock
 	ps.peer_choking = true
+	ps.pex.allocator = allocator
 
 	out, eerr := encode_handshake(local, allocator)
 	if eerr.kind != .None {
@@ -187,17 +190,57 @@ connect_session :: proc(
 	}
 
 	if want_metadata && ps.got_extended {
-		raw, ok, merr := fetch_metadata(sock, ps.extended, want_hash, allocator)
-		if ok {
-			metadata = raw
-		} else if merr.kind != .None {
-			if merr.message != "" {
-				delete(merr.message, allocator)
+		size := ps.extended.metadata_size
+		_, has_ut := extension_id(ps.extended, UT_METADATA)
+		if has_ut && size > 0 {
+			raw, ok, merr := fetch_metadata(sock, ps.extended, want_hash, allocator)
+			if ok {
+				metadata = raw
+			} else if merr.kind != .None {
+				if merr.message != "" {
+					delete(merr.message, allocator)
+				}
 			}
+		} else if has_ut {
+			// Peer has no metadata — harvest PEX for seeds instead of burning rejects.
+			_ = net.set_option(sock, .Receive_Timeout, 5 * time.Second)
+			harvest_pex_into(sock, &ps, allocator)
+			_ = net.set_option(sock, .Receive_Timeout, DOWNLOAD_TIMEOUT)
 		}
 	}
 
 	return ps, metadata, {}
+}
+
+// connect_session_pex is like connect_session but also returns ut_pex peers.
+connect_session_pex :: proc(
+	endpoint: net.Endpoint,
+	local: Handshake,
+	listen_port: u16 = 0,
+	want_metadata: bool = false,
+	want_hash: [20]u8 = {},
+	timeout: time.Duration = HANDSHAKE_TIMEOUT,
+	allocator := context.allocator,
+) -> (
+	ps: Peer_Session,
+	metadata: []byte,
+	pex: []net.Endpoint,
+	err: Error,
+) {
+	ps, metadata, err = connect_session(endpoint, local, 0, listen_port, want_metadata, want_hash, timeout, allocator)
+	if err.kind != .None {
+		return ps, metadata, nil, err
+	}
+	if len(metadata) == 0 && ps.got_extended {
+		_ = net.set_option(ps.sock, .Receive_Timeout, 4 * time.Second)
+		harvest_pex_into(ps.sock, &ps, allocator)
+		_ = net.set_option(ps.sock, .Receive_Timeout, DOWNLOAD_TIMEOUT)
+	}
+	if len(ps.pex) > 0 {
+		pex = make([]net.Endpoint, len(ps.pex), allocator)
+		copy(pex, ps.pex[:])
+	}
+	return ps, metadata, pex, {}
 }
 
 @(private)
@@ -243,7 +286,10 @@ apply_wire_message :: proc(ps: ^Peer_Session, msg: Message, allocator := context
 		bitfield_destroy(&ps.bitfield, allocator)
 		ps.bitfield = bitfield_from_bytes(msg.payload, count, allocator)
 	case .Extended:
-		if len(msg.payload) > 0 && msg.payload[0] == EXT_HANDSHAKE_ID {
+		if len(msg.payload) == 0 {
+			return
+		}
+		if msg.payload[0] == EXT_HANDSHAKE_ID {
 			ext, err := decode_extended_handshake(msg.payload, allocator)
 			if err.kind == .None {
 				extended_destroy(&ps.extended, allocator)
@@ -251,6 +297,12 @@ apply_wire_message :: proc(ps: ^Peer_Session, msg: Message, allocator := context
 				ps.got_extended = true
 			} else if err.message != "" {
 				delete(err.message, allocator)
+			}
+			return
+		}
+		if ps.got_extended {
+			if pex_id, ok := extension_id(ps.extended, UT_PEX); ok && msg.payload[0] == pex_id {
+				append_pex_peers(&ps.pex, msg.payload, allocator)
 			}
 		}
 	}
