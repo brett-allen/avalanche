@@ -20,7 +20,7 @@ Options :: struct {
 	port:        u16    `usage:"BitTorrent listen port (default 6881)"`,
 	api_port:    u16    `args:"name=api-port" usage:"HTTP API listen port (default 8080)"`,
 	no_announce: bool   `args:"name=no-announce" usage:"Do not contact HTTP trackers"`,
-	verbose:     bool   `args:"name=verbose" usage:"Show tracker/peer protocol detail"`,
+	verbose:     bool   `args:"name=verbose" usage:"Debug logging (file:line + dial detail)"`,
 }
 
 parse_command :: proc(cmd: string) -> (Command, bool) {
@@ -72,7 +72,7 @@ usage :: proc() {
 		"  --port <n>           BitTorrent listen port (default %d)\n" +
 		"  --api-port <n>       HTTP API port for serve (default %d)\n" +
 		"  --no-announce        Do not contact trackers\n" +
-		"  --verbose            Show tracker/peer protocol detail\n",
+		"  --verbose            Debug logging (file:line + tracker/peer dial detail)\n",
 		os.args[0],
 		int(session.DEFAULT_PORT),
 		int(api.DEFAULT_API_PORT),

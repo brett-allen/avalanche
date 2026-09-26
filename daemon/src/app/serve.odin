@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:log"
 import "core:net"
 import "core:os"
 import "avalanche:api"
@@ -13,6 +14,9 @@ run_serve :: proc(opt: Options) {
 
 	eng := session.engine_make(bt_port)
 	defer session.engine_destroy(eng)
+
+	log.infof("avalanched starting peer_port=%d api_port=%d output=%s dht=%v",
+		int(bt_port), int(api_port), out, eng.client.dht != nil)
 
 	fmt.printfln("avalanched")
 	fmt.printfln("  peer listen  %d", int(bt_port))
@@ -33,6 +37,7 @@ run_serve :: proc(opt: Options) {
 		output = out,
 	})
 	if err != nil {
+		log.errorf("api server stopped: %v", err)
 		fmt.eprintfln("%s server stopped: %v", paint(.Err, "error:"), err)
 		os.exit(1)
 	}

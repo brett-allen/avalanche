@@ -1,5 +1,6 @@
 package session
 
+import "core:log"
 import "core:net"
 import "core:strings"
 import "core:time"
@@ -45,6 +46,7 @@ collect_swarm :: proc(
 
 	// Trackers first — usually returns something within a few seconds.
 	req := announce_request(client, magnet)
+	tracker_peers := 0
 	for url in magnet.trackers {
 		if len(peers) >= MAX_ANNOUNCE_PEERS {
 			break
@@ -54,38 +56,51 @@ collect_swarm :: proc(
 		}
 		res, aerr := tracker.announce(url, req, allocator)
 		if aerr.kind != .None {
+			log.debugf("tracker: announce failed %s: %s", url, aerr.message)
 			if aerr.message != "" {
 				delete(aerr.message, allocator)
 			}
 			continue
 		}
+		before := len(peers)
 		for p in res.peers {
 			_ = append_unique_peer(&peers, p.endpoint)
 			if len(peers) >= MAX_ANNOUNCE_PEERS {
 				break
 			}
 		}
+		added := len(peers) - before
+		tracker_peers += added
+		log.infof("tracker: %s peers=%d complete=%d incomplete=%d (+%d unique)",
+			url, len(res.peers), res.complete, res.incomplete, added)
 		tracker.announce_destroy(&res)
 	}
 
 	// DHT fills in dialable peers trackers miss (esp. for magnets).
+	dht_added := 0
 	if client.dht != nil && len(peers) < MAX_ANNOUNCE_PEERS {
 		info_hash := dht.Node_ID(magnet.info_hash)
+		log.info("dht: get_peers …")
 		dht_peers, derr := dht.get_peers(client.dht, info_hash, allocator)
 		if derr.kind != .None {
+			log.warnf("dht: get_peers failed: %s", derr.message)
 			if derr.message != "" {
 				delete(derr.message, allocator)
 			}
 		} else {
+			before := len(peers)
 			for ep in dht_peers {
 				_ = append_unique_peer(&peers, ep)
 				if len(peers) >= MAX_ANNOUNCE_PEERS {
 					break
 				}
 			}
+			dht_added = len(peers) - before
+			log.infof("dht: get_peers returned %d (+%d unique)", len(dht_peers), dht_added)
 			delete(dht_peers, allocator)
 		}
 	}
+	log.infof("swarm: %d peers (trackers +%d, dht +%d)", len(peers), tracker_peers, dht_added)
 	return peers, {}
 }
 
@@ -103,6 +118,9 @@ ensure_metadata :: proc(
 		return session_fail(.Invalid, "could not fetch torrent metadata from peers", allocator)
 	}
 
+	log.infof("metadata: fetching from up to %d peers (inbound=%v)",
+		min(len(peers), MAX_METADATA_PEERS), listener != 0)
+
 	local := peer.make_handshake(transmute([20]u8)tor.magnet.info_hash, client.peer_id)
 	want_hash := transmute([20]u8)tor.magnet.info_hash
 
@@ -119,9 +137,15 @@ ensure_metadata :: proc(
 		if lerr.kind == .None {
 			listen_sock = created
 			owns_listener = true
-		} else if lerr.message != "" {
-			delete(lerr.message, allocator)
+			log.infof("metadata: listening for inbound peers on tcp/%d", int(client.listen_port))
+		} else {
+			log.debugf("metadata: could not listen: %s", lerr.message)
+			if lerr.message != "" {
+				delete(lerr.message, allocator)
+			}
 		}
+	} else {
+		log.infof("metadata: using shared listen socket on tcp/%d", int(client.listen_port))
 	}
 	defer if owns_listener && listen_sock != 0 {
 		net.close(listen_sock)
@@ -156,6 +180,8 @@ ensure_metadata :: proc(
 						tor.meta.info = info
 						tor.meta.info_hash = ih
 						tor.has_meta = true
+						log.infof("metadata: got %d bytes from inbound peer (name=%q)",
+							int(metainfo.total_length(info)), info.name)
 						return {}
 					}
 					if ierr.kind == .None {
@@ -163,6 +189,7 @@ ensure_metadata :: proc(
 					}
 					continue
 				}
+				pex_n := 0
 				for ep in ps.pex {
 					exists := false
 					for have in endpoints {
@@ -173,7 +200,11 @@ ensure_metadata :: proc(
 					}
 					if !exists {
 						append(&endpoints, ep)
+						pex_n += 1
 					}
+				}
+				if pex_n > 0 {
+					log.debugf("metadata: inbound peer gave +%d pex", pex_n)
 				}
 				peer.peer_session_destroy(&ps, allocator)
 			}
@@ -189,6 +220,8 @@ ensure_metadata :: proc(
 		ep := endpoints[next]
 		next += 1
 		tried += 1
+		ep_s := net.endpoint_to_string(ep, context.temp_allocator)
+		log.debugf("metadata: dialing %s (%d/%d)", ep_s, tried, MAX_METADATA_PEERS)
 
 		ps, raw, pex, err := peer.connect_session_pex(
 			ep,
@@ -200,12 +233,18 @@ ensure_metadata :: proc(
 			allocator,
 		)
 		if err.kind != .None {
+			log.debugf("metadata: dial %s failed: %s", ep_s, err.message)
 			if err.message != "" {
 				delete(err.message, allocator)
 			}
 			peer.peer_session_destroy(&ps, allocator)
 			continue
 		}
+		client_name := ps.extended.client if ps.got_extended else ""
+		msize := ps.extended.metadata_size if ps.got_extended else i64(0)
+		log.debugf("metadata: connected %s client=%q msize=%d pex=%d",
+			ep_s, client_name, msize, len(pex))
+		pex_n := 0
 		for ep2 in pex {
 			exists := false
 			for have in endpoints {
@@ -216,7 +255,11 @@ ensure_metadata :: proc(
 			}
 			if !exists {
 				append(&endpoints, ep2)
+				pex_n += 1
 			}
+		}
+		if pex_n > 0 {
+			log.infof("metadata: +%d peers from ut_pex via %s", pex_n, ep_s)
 		}
 		delete(pex, allocator)
 		peer.peer_session_destroy(&ps, allocator)
@@ -226,17 +269,22 @@ ensure_metadata :: proc(
 		info, ih, ierr := metainfo.parse_info(raw, allocator)
 		delete(raw, allocator)
 		if ierr.kind != .None {
+			log.debugf("metadata: parse failed from %s", ep_s)
 			continue
 		}
 		if ih != tor.magnet.info_hash {
 			metainfo.info_destroy(&info, allocator)
+			log.warnf("metadata: infohash mismatch from %s", ep_s)
 			continue
 		}
 		tor.meta.info = info
 		tor.meta.info_hash = ih
 		tor.has_meta = true
+		log.infof("metadata: got info name=%q length=%d from %s",
+			info.name, metainfo.total_length(info), ep_s)
 		return {}
 	}
+	log.warnf("metadata: failed after contacting %d peers (queue=%d)", tried, len(endpoints))
 	return session_fail(.Invalid, "could not fetch torrent metadata from peers", allocator)
 }
 

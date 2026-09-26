@@ -4,6 +4,7 @@
 */
 package session
 
+import "core:log"
 import "core:mem"
 import "core:net"
 import "core:os"
@@ -220,8 +221,10 @@ engine_spawn :: proc(
 
 	th := thread.create(torrent_worker)
 	th.data = t
+	th.init_context = context
 	t.thread = th
 	thread.start(th)
+	log.infof("torrent %d queued infohash=%s", int(id), t.status.infohash)
 	return id, {}
 }
 
@@ -633,13 +636,17 @@ torrent_worker :: proc(th: ^thread.Thread) {
 	}
 
 	torrent_set_state(t, .Announcing)
+	log.infof("torrent %d announcing…", int(t.id))
 
 	listener, lerr := peer.listen_peers(e.client.listen_port, alloc)
 	if lerr.kind != .None {
+		log.debugf("torrent %d: listen failed: %s", int(t.id), lerr.message)
 		if lerr.message != "" {
 			delete(lerr.message, alloc)
 		}
 		listener = 0
+	} else {
+		log.infof("torrent %d: listening for peers on tcp/%d", int(t.id), int(e.client.listen_port))
 	}
 	defer if listener != 0 {
 		net.close(listener)
@@ -654,6 +661,7 @@ torrent_worker :: proc(th: ^thread.Thread) {
 	}
 
 	if len(peers) == 0 && listener == 0 {
+		log.errorf("torrent %d: no peers from trackers or DHT", int(t.id))
 		torrent_set_state(t, .Failed, "no peers from trackers or DHT")
 		return
 	}
@@ -669,12 +677,15 @@ torrent_worker :: proc(th: ^thread.Thread) {
 		if merr.message != "" {
 			delete(merr.message, alloc)
 		}
+		log.errorf("torrent %d: %s", int(t.id), msg)
 		torrent_set_state(t, .Failed, msg)
 		delete(msg, alloc)
 		return
 	}
 	t.meta = view.meta
 	t.has_meta = view.has_meta
+	log.infof("torrent %d: metadata ok name=%q pieces=%d",
+		int(t.id), t.meta.info.name, metainfo.piece_count(t.meta.info))
 
 	sync.lock(&t.mu)
 	t.status.pieces_total = metainfo.piece_count(t.meta.info)
@@ -702,6 +713,8 @@ torrent_worker :: proc(th: ^thread.Thread) {
 	defer storage.close(&store, alloc)
 
 	torrent_set_state(t, .Downloading)
+	log.infof("torrent %d: downloading %q (%d pieces)",
+		int(t.id), t.meta.info.name, metainfo.piece_count(t.meta.info))
 
 	local := peer.make_handshake(transmute([20]u8)t.meta.info_hash, e.client.peer_id)
 	endpoints: [dynamic]net.Endpoint
@@ -730,6 +743,7 @@ torrent_worker :: proc(th: ^thread.Thread) {
 	t.status.peers_active = 0
 	if t.stop {
 		t.status.state = .Stopped
+		log.infof("torrent %d: stopped (%d pieces)", int(t.id), n)
 		if derr.kind != .None && derr.message != "" {
 			delete(derr.message, alloc)
 		}
@@ -737,6 +751,7 @@ torrent_worker :: proc(th: ^thread.Thread) {
 		t.status.state = .Failed
 		delete(t.status.error, alloc)
 		t.status.error = strings.clone(peer.error_string(derr), alloc)
+		log.errorf("torrent %d: download failed: %s", int(t.id), t.status.error)
 		if derr.message != "" {
 			delete(derr.message, alloc)
 		}
@@ -744,6 +759,7 @@ torrent_worker :: proc(th: ^thread.Thread) {
 		t.status.state = .Complete
 		t.status.pieces_done = t.status.pieces_total
 		t.status.bytes_done = t.status.bytes_total
+		log.infof("torrent %d: complete (%d pieces)", int(t.id), t.status.pieces_total)
 	}
 	sync.unlock(&t.mu)
 }
