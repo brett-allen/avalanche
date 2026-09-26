@@ -34,12 +34,34 @@ Torrent_JSON :: struct {
 	pieces_total: int    `json:"pieces_total"`,
 	bytes_done:   i64    `json:"bytes_done"`,
 	bytes_total:  i64    `json:"bytes_total"`,
+	down_rate:    i64    `json:"down_rate"`,
+	up_rate:      i64    `json:"up_rate"`,
 	peers_tried:  int    `json:"peers_tried"`,
 	peers_live:   int    `json:"peers_live"`,
 	peers_failed: int    `json:"peers_failed"`,
 	peers_active: int    `json:"peers_active"`,
 	error:        string `json:"error,omitempty"`,
 	output:       string `json:"output"`,
+}
+
+File_JSON :: struct {
+	name:  string `json:"name"`,
+	done:  i64    `json:"done"`,
+	total: i64    `json:"total"`,
+}
+
+Peer_JSON :: struct {
+	endpoint:  string `json:"endpoint"`,
+	client:    string `json:"client"`,
+	down_rate: i64    `json:"down_rate"`,
+}
+
+Detail_JSON :: struct {
+	id:        u64         `json:"id"`,
+	down_rate: i64         `json:"down_rate"`,
+	up_rate:   i64         `json:"up_rate"`,
+	files:     []File_JSON `json:"files"`,
+	peers:     []Peer_JSON `json:"peers"`,
 }
 
 Add_Request :: struct {
@@ -70,12 +92,32 @@ status_to_json :: proc(st: session.Torrent_Status) -> Torrent_JSON {
 		pieces_total = st.pieces_total,
 		bytes_done   = st.bytes_done,
 		bytes_total  = st.bytes_total,
+		down_rate    = st.down_rate,
+		up_rate      = st.up_rate,
 		peers_tried  = st.peers_tried,
 		peers_live   = st.peers_live,
 		peers_failed = st.peers_failed,
 		peers_active = st.peers_active,
 		error        = st.error,
 		output       = st.output,
+	}
+}
+
+detail_to_json :: proc(d: session.Torrent_Detail) -> Detail_JSON {
+	files := make([]File_JSON, len(d.files))
+	for f, i in d.files {
+		files[i] = File_JSON{name = f.name, done = f.done, total = f.total}
+	}
+	peers := make([]Peer_JSON, len(d.peers))
+	for p, i in d.peers {
+		peers[i] = Peer_JSON{endpoint = p.endpoint, client = p.client, down_rate = p.down_rate}
+	}
+	return Detail_JSON{
+		id        = u64(d.id),
+		down_rate = d.down_rate,
+		up_rate   = d.up_rate,
+		files     = files,
+		peers     = peers,
 	}
 }
 
@@ -96,6 +138,7 @@ listen_and_serve :: proc(eng: ^session.Engine, cfg: Server_Config) -> net.Networ
 
 	http.route_get(&router, "/health", http.handler(handle_health))
 	http.route_get(&router, "/api/torrents", http.handler(handle_list))
+	http.route_get(&router, "/api/torrents/(%d+)/details", http.handler(handle_details))
 	http.route_get(&router, "/api/torrents/(%d+)", http.handler(handle_get))
 	http.route_post(&router, "/api/torrents", http.handler(handle_add))
 	http.route_post(&router, "/api/torrents/(%d+)/stop", http.handler(handle_stop))
@@ -148,6 +191,22 @@ handle_get :: proc(req: ^http.Request, res: ^http.Response) {
 	}
 	defer session.status_destroy(&st)
 	http.respond_json(res, status_to_json(st))
+}
+
+@(private)
+handle_details :: proc(req: ^http.Request, res: ^http.Response) {
+	id, ok := parse_id_param(req)
+	if !ok {
+		http.respond_json(res, Error_Body{error = "invalid id"}, .Bad_Request)
+		return
+	}
+	detail, found := session.engine_details(g_engine, id)
+	if !found {
+		http.respond_json(res, Error_Body{error = "not found"}, .Not_Found)
+		return
+	}
+	defer session.detail_destroy(&detail)
+	http.respond_json(res, detail_to_json(detail))
 }
 
 @(private)

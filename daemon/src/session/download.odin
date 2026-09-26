@@ -167,6 +167,8 @@ download :: proc(
 		client.listen_port,
 		on_progress,
 		progress_user,
+		nil,
+		nil,
 		allocator,
 	)
 	result.pieces = n

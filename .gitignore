@@ -1,4 +1,12 @@
 /build/
 /avalanche
+/avalanched
 /bencode_smoke
 /downloads/
+daemon/build/
+daemon/avalanched
+daemon/downloads/
+frontend/node_modules/
+frontend/dist/
+frontend/out/
+.DS_Store

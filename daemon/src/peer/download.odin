@@ -12,10 +12,7 @@ import "core:time"
 import "avalanche:metainfo"
 import "avalanche:storage"
 
-DOWNLOAD_TIMEOUT     :: 30 * time.Second
-MAX_PEER_TRIES       :: 64
-MAX_CONCURRENT_PEERS :: 8
-MAX_ACTIVE_DISPLAY   :: 8
+DOWNLOAD_TIMEOUT :: 30 * time.Second
 
 Progress_Event :: enum {
 	Peer_Try,
@@ -25,8 +22,9 @@ Progress_Event :: enum {
 }
 
 Active_Peer :: struct {
-	endpoint: string,
-	client:   string,
+	endpoint:  string,
+	client:    string,
+	down_rate: i64, // bytes/sec for this peer connection
 }
 
 Progress :: struct {
@@ -35,6 +33,7 @@ Progress :: struct {
 	pieces_total: int,
 	bytes_done:   i64,
 	bytes_total:  i64,
+	down_rate:    i64, // aggregate download bytes/sec across active peers
 	peer:         string,
 	peer_client:  string,
 	peers_tried:  int,
@@ -45,6 +44,8 @@ Progress :: struct {
 }
 
 Progress_Proc :: #type proc(p: Progress, user: rawptr)
+Stop_Proc :: #type proc(user: rawptr) -> bool
+Sock_Proc :: #type proc(user: rawptr, slot: int, sock: net.TCP_Socket)
 
 Peer_Session :: struct {
 	sock:          net.TCP_Socket,
@@ -58,24 +59,31 @@ Peer_Session :: struct {
 
 @(private)
 Swarm :: struct {
-	mu:           sync.Mutex,
-	info:         metainfo.Info,
-	store:        ^storage.Store,
-	local:        Handshake,
-	listen_port:  u16,
-	have:         Bitfield,
-	claimed:      Bitfield,
-	endpoints:    []net.Endpoint,
-	next_ep:      int,
-	peers_tried:  int,
-	peers_live:   int,
-	peers_failed: int,
-	pieces_got:   int,
-	on_progress:  Progress_Proc,
-	progress_user: rawptr,
-	active:       [MAX_CONCURRENT_PEERS]Active_Peer,
-	active_on:    [MAX_CONCURRENT_PEERS]bool,
-	allocator:    mem.Allocator,
+	mu:                sync.Mutex,
+	info:              metainfo.Info,
+	store:             ^storage.Store,
+	local:             Handshake,
+	listen_port:       u16,
+	have:              Bitfield,
+	claimed:           Bitfield,
+	endpoints:         []net.Endpoint,
+	next_ep:           int,
+	peers_tried:       int,
+	peers_live:        int,
+	peers_failed:      int,
+	pieces_got:        int,
+	on_progress:       Progress_Proc,
+	progress_user:     rawptr,
+	should_stop:       Stop_Proc,
+	on_sock:           Sock_Proc,
+	slots:             int,
+	active:            []Active_Peer,
+	active_on:         []bool,
+	active_bytes:      []i64,
+	active_rate_bytes: []i64,
+	active_rate_tick:  []time.Tick,
+	active_rate:       []i64,
+	allocator:         mem.Allocator,
 }
 
 peer_session_destroy :: proc(ps: ^Peer_Session, allocator := context.allocator) {
@@ -249,6 +257,24 @@ apply_wire_message :: proc(ps: ^Peer_Session, msg: Message, allocator := context
 }
 
 @(private)
+swarm_should_stop :: proc(s: ^Swarm) -> bool {
+	if s == nil {
+		return false
+	}
+	if s.should_stop != nil {
+		return s.should_stop(s.progress_user)
+	}
+	return false
+}
+
+@(private)
+swarm_bind_sock :: proc(s: ^Swarm, slot: int, sock: net.TCP_Socket) {
+	if s.on_sock != nil {
+		s.on_sock(s.progress_user, slot, sock)
+	}
+}
+
+@(private)
 swarm_complete :: proc(s: ^Swarm) -> bool {
 	for i in 0 ..< s.have.count {
 		if !bitfield_has(s.have, i) {
@@ -262,7 +288,7 @@ swarm_complete :: proc(s: ^Swarm) -> bool {
 swarm_next_endpoint :: proc(s: ^Swarm) -> (ep: net.Endpoint, label: string, ok: bool) {
 	sync.lock(&s.mu)
 	defer sync.unlock(&s.mu)
-	if swarm_complete(s) || s.next_ep >= len(s.endpoints) || s.peers_tried >= MAX_PEER_TRIES {
+	if swarm_complete(s) || swarm_should_stop(s) || s.next_ep >= len(s.endpoints) {
 		return {}, "", false
 	}
 	ep = s.endpoints[s.next_ep]
@@ -334,7 +360,7 @@ swarm_unclaim_locked :: proc(s: ^Swarm, index: int) {
 swarm_set_active :: proc(s: ^Swarm, slot: int, endpoint, client: string, on: bool) {
 	sync.lock(&s.mu)
 	defer sync.unlock(&s.mu)
-	if slot < 0 || slot >= MAX_CONCURRENT_PEERS {
+	if slot < 0 || slot >= s.slots {
 		return
 	}
 	if s.active_on[slot] {
@@ -342,6 +368,10 @@ swarm_set_active :: proc(s: ^Swarm, slot: int, endpoint, client: string, on: boo
 		delete(s.active[slot].client, s.allocator)
 		s.active[slot] = {}
 		s.active_on[slot] = false
+		s.active_bytes[slot] = 0
+		s.active_rate_bytes[slot] = 0
+		s.active_rate_tick[slot] = {}
+		s.active_rate[slot] = 0
 	}
 	if on {
 		s.active[slot] = Active_Peer{
@@ -349,30 +379,70 @@ swarm_set_active :: proc(s: ^Swarm, slot: int, endpoint, client: string, on: boo
 			client   = strings.clone(client, s.allocator),
 		}
 		s.active_on[slot] = true
+		s.active_bytes[slot] = 0
+		s.active_rate_bytes[slot] = 0
+		s.active_rate_tick[slot] = time.tick_now()
+		s.active_rate[slot] = 0
+	}
+}
+
+@(private)
+swarm_note_recv :: proc(s: ^Swarm, slot: int, n: int) {
+	if s == nil || n <= 0 || slot < 0 || slot >= s.slots {
+		return
+	}
+	sync.lock(&s.mu)
+	defer sync.unlock(&s.mu)
+	if !s.active_on[slot] {
+		return
+	}
+	s.active_bytes[slot] += i64(n)
+	now := time.tick_now()
+	dt := time.duration_seconds(time.tick_diff(s.active_rate_tick[slot], now))
+	if dt >= 0.4 {
+		gained := s.active_bytes[slot] - s.active_rate_bytes[slot]
+		if gained < 0 {
+			gained = 0
+		}
+		s.active_rate[slot] = i64(f64(gained) / dt)
+		s.active_rate_bytes[slot] = s.active_bytes[slot]
+		s.active_rate_tick[slot] = now
 	}
 }
 
 @(private)
 swarm_collect_active :: proc(s: ^Swarm) -> []Active_Peer {
 	n := 0
-	for i in 0 ..< MAX_CONCURRENT_PEERS {
+	for i in 0 ..< s.slots {
 		if s.active_on[i] {
 			n += 1
 		}
 	}
 	out := make([]Active_Peer, n, context.temp_allocator)
 	j := 0
-	for i in 0 ..< MAX_CONCURRENT_PEERS {
+	for i in 0 ..< s.slots {
 		if !s.active_on[i] {
 			continue
 		}
 		out[j] = Active_Peer{
-			endpoint = strings.clone(s.active[i].endpoint, context.temp_allocator),
-			client   = strings.clone(s.active[i].client, context.temp_allocator),
+			endpoint  = strings.clone(s.active[i].endpoint, context.temp_allocator),
+			client    = strings.clone(s.active[i].client, context.temp_allocator),
+			down_rate = s.active_rate[i],
 		}
 		j += 1
 	}
 	return out
+}
+
+@(private)
+swarm_down_rate :: proc(s: ^Swarm) -> i64 {
+	total: i64
+	for i in 0 ..< s.slots {
+		if s.active_on[i] {
+			total += s.active_rate[i]
+		}
+	}
+	return total
 }
 
 @(private)
@@ -394,12 +464,14 @@ swarm_emit :: proc(s: ^Swarm, event: Progress_Event, peer_label := "", peer_clie
 	}
 	files := metainfo.file_progress(s.info, have_flags, context.temp_allocator)
 	active := swarm_collect_active(s)
+	rate := swarm_down_rate(s)
 	p := Progress{
 		event        = event,
 		pieces_done  = done_n,
 		pieces_total = total,
 		bytes_done   = done_bytes,
 		bytes_total  = metainfo.total_length(s.info),
+		down_rate    = rate,
 		peer         = peer_label,
 		peer_client  = peer_client,
 		peers_tried  = s.peers_tried,
@@ -419,7 +491,7 @@ swarm_worker :: proc(t: ^thread.Thread) {
 	allocator := s.allocator
 
 	for {
-		if swarm_complete(s) {
+		if swarm_complete(s) || swarm_should_stop(s) {
 			break
 		}
 		ep, label, ok := swarm_next_endpoint(s)
@@ -455,15 +527,17 @@ swarm_worker :: proc(t: ^thread.Thread) {
 		s.peers_live += 1
 		sync.unlock(&s.mu)
 		swarm_set_active(s, slot, label, client_name, true)
+		swarm_bind_sock(s, slot, ps.sock)
 		swarm_emit(s, .Peer_Live, label, client_name)
 
 		_, _ = leech_from_peer(s, &ps, label, slot, allocator)
 
+		swarm_bind_sock(s, slot, 0)
 		swarm_set_active(s, slot, "", "", false)
 		peer_session_destroy(&ps, allocator)
 		delete(label, allocator)
 
-		if swarm_complete(s) {
+		if swarm_complete(s) || swarm_should_stop(s) {
 			break
 		}
 	}
@@ -493,7 +567,7 @@ leech_from_peer :: proc(
 	}
 
 	for {
-		if swarm_complete(s) {
+		if swarm_complete(s) || swarm_should_stop(s) {
 			return pieces, {}
 		}
 		index, ok := swarm_claim_piece(s, ps.bitfield)
@@ -509,11 +583,17 @@ leech_from_peer :: proc(
 		buf := make([]byte, plen, allocator)
 		got := make([]bool, (plen + BLOCK_SIZE - 1) / BLOCK_SIZE, allocator)
 
-		derr := download_piece(ps, u32(index), buf, got, allocator)
+		derr := download_piece(ps, u32(index), buf, got, s, slot, allocator)
 		if derr.kind != .None {
 			delete(buf, allocator)
 			delete(got, allocator)
 			swarm_unclaim(s, index)
+			if derr.kind == .Cancelled || swarm_should_stop(s) {
+				if derr.message != "" {
+					delete(derr.message, allocator)
+				}
+				return pieces, {}
+			}
 			return pieces, derr
 		}
 		if !metainfo.verify_piece(s.info, index, buf) {
@@ -577,6 +657,8 @@ download_piece :: proc(
 	index: u32,
 	buf: []byte,
 	got: []bool,
+	s: ^Swarm = nil,
+	slot: int = -1,
 	allocator := context.allocator,
 ) -> Error {
 	pending := 0
@@ -585,6 +667,9 @@ download_piece :: proc(
 	blocks := len(got)
 
 	for received < blocks {
+		if swarm_should_stop(s) {
+			return peer_fail(.Cancelled, "download stopped", allocator)
+		}
 		for pending < MAX_PIPELINE && next_begin < len(buf) {
 			if ps.peer_choking {
 				break
@@ -663,6 +748,7 @@ download_piece :: proc(
 				if pending < 0 {
 					pending = 0
 				}
+				swarm_note_recv(s, slot, len(block))
 			}
 		case .Extended, .Interested, .Not_Interested, .Request, .Cancel, .Port:
 		}
@@ -679,6 +765,8 @@ download_torrent :: proc(
 	listen_port: u16 = 0,
 	on_progress: Progress_Proc = nil,
 	progress_user: rawptr = nil,
+	should_stop: Stop_Proc = nil,
+	on_sock: Sock_Proc = nil,
 	allocator := context.allocator,
 ) -> (
 	pieces: int,
@@ -689,30 +777,45 @@ download_torrent :: proc(
 		return 0, peer_fail(.Invalid, "no pieces to download", allocator)
 	}
 
+	workers := max(1, len(endpoints))
 	swarm := Swarm{
-		info          = info,
-		store         = store,
-		local         = local,
-		listen_port   = listen_port,
-		have          = bitfield_make(total, allocator),
-		claimed       = bitfield_make(total, allocator),
-		endpoints     = endpoints,
-		on_progress   = on_progress,
-		progress_user = progress_user,
-		allocator     = allocator,
+		info              = info,
+		store             = store,
+		local             = local,
+		listen_port       = listen_port,
+		have              = bitfield_make(total, allocator),
+		claimed           = bitfield_make(total, allocator),
+		endpoints         = endpoints,
+		on_progress       = on_progress,
+		progress_user     = progress_user,
+		should_stop       = should_stop,
+		on_sock           = on_sock,
+		slots             = workers,
+		active            = make([]Active_Peer, workers, allocator),
+		active_on         = make([]bool, workers, allocator),
+		active_bytes      = make([]i64, workers, allocator),
+		active_rate_bytes = make([]i64, workers, allocator),
+		active_rate_tick  = make([]time.Tick, workers, allocator),
+		active_rate       = make([]i64, workers, allocator),
+		allocator         = allocator,
 	}
 	defer {
 		bitfield_destroy(&swarm.have, allocator)
 		bitfield_destroy(&swarm.claimed, allocator)
-		for i in 0 ..< MAX_CONCURRENT_PEERS {
+		for i in 0 ..< swarm.slots {
 			if swarm.active_on[i] {
 				delete(swarm.active[i].endpoint, allocator)
 				delete(swarm.active[i].client, allocator)
 			}
 		}
+		delete(swarm.active, allocator)
+		delete(swarm.active_on, allocator)
+		delete(swarm.active_bytes, allocator)
+		delete(swarm.active_rate_bytes, allocator)
+		delete(swarm.active_rate_tick, allocator)
+		delete(swarm.active_rate, allocator)
 	}
 
-	workers := min(MAX_CONCURRENT_PEERS, max(1, len(endpoints)))
 	threads := make([]^thread.Thread, workers, allocator)
 	defer delete(threads, allocator)
 
@@ -731,6 +834,9 @@ download_torrent :: proc(
 	}
 
 	pieces = swarm.pieces_got
+	if swarm_should_stop(&swarm) {
+		return pieces, {}
+	}
 	if !swarm_complete(&swarm) {
 		return pieces, peer_fail(.Protocol, "download incomplete", allocator)
 	}

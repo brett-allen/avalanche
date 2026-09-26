@@ -18,7 +18,7 @@ test)
 	;;
 *)
 	odin build src/app \
-		-out:avalanche \
+		-out:avalanched \
 		-collection:avalanche=src \
 		-collection:deps=vendor \
 		"$@"

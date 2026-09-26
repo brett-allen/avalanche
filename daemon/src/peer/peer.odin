@@ -34,6 +34,7 @@ Error_Kind :: enum {
 	Connect,
 	Timeout,
 	IO,
+	Cancelled,
 }
 
 Error :: struct {
@@ -57,6 +58,8 @@ error_string :: proc(err: Error) -> string {
 		return err.message if err.message != "" else "peer: timed out"
 	case .IO:
 		return err.message if err.message != "" else "peer: i/o error"
+	case .Cancelled:
+		return err.message if err.message != "" else "peer: cancelled"
 	}
 	return "peer: unknown error"
 }

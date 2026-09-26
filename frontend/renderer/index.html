@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Avalanche</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="top">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <h1>Avalanche</h1>
+        </div>
+        <div class="header-right">
+          <p id="overall-speed" class="overall-speed" aria-live="polite">▼ 0 B/s  ▲ 0 B/s</p>
+          <div class="daemon" id="daemon-status" data-state="unknown">
+            <span class="daemon-dot"></span>
+            <span class="daemon-label">daemon…</span>
+            <button type="button" class="ghost" id="btn-daemon-toggle">Start</button>
+          </div>
+        </div>
+      </header>
+
+      <section class="compose" aria-label="Add torrent">
+        <label class="sr-only" for="magnet-input">Magnet URI</label>
+        <input
+          id="magnet-input"
+          type="text"
+          placeholder="Paste a magnet link…"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <div class="compose-actions">
+          <button type="button" class="primary" id="btn-add-magnet">Add</button>
+          <button type="button" class="ghost" id="btn-open-torrent">Open .torrent</button>
+        </div>
+      </section>
+
+      <div class="workspace">
+        <section class="torrents" aria-label="Torrents">
+          <div class="torrents-head">
+            <h2>Transfers</h2>
+            <p id="torrent-meta">Waiting for daemon</p>
+          </div>
+          <ul id="torrent-list" class="torrent-list"></ul>
+          <p id="empty-state" class="empty hidden">No torrents yet.</p>
+        </section>
+
+        <aside id="detail-panel" class="detail-panel hidden" aria-label="Transfer details">
+          <div class="detail-head">
+            <h2 id="detail-title">Details</h2>
+            <button type="button" class="ghost" id="btn-detail-close" aria-label="Close details">Close</button>
+          </div>
+          <p id="detail-speed" class="detail-speed">▼ 0 B/s  ▲ 0 B/s</p>
+
+          <div class="detail-tabs" role="tablist" aria-label="Detail sections">
+            <button type="button" class="detail-tab is-active" role="tab" aria-selected="true" data-tab="files" id="tab-files">Files</button>
+            <button type="button" class="detail-tab" role="tab" aria-selected="false" data-tab="peers" id="tab-peers">Peers</button>
+          </div>
+
+          <div class="detail-tab-panels">
+            <div id="panel-files" class="detail-tab-panel" role="tabpanel" aria-labelledby="tab-files">
+              <ul id="detail-files" class="detail-list"></ul>
+              <p id="detail-files-empty" class="detail-empty hidden">No file data yet.</p>
+            </div>
+            <div id="panel-peers" class="detail-tab-panel hidden" role="tabpanel" aria-labelledby="tab-peers">
+              <ul id="detail-peers" class="detail-list"></ul>
+              <p id="detail-peers-empty" class="detail-empty hidden">No active peers.</p>
+            </div>
+          </div>
+        </aside>
+      </div>
+
+      <p id="toast" class="toast hidden" role="status"></p>
+    </div>
+    <script src="renderer.js"></script>
+  </body>
+</html>

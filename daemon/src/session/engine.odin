@@ -34,12 +34,28 @@ Torrent_Status :: struct {
 	pieces_total: int,
 	bytes_done:   i64,
 	bytes_total:  i64,
+	down_rate:    i64, // bytes/sec
+	up_rate:      i64, // bytes/sec (leech-only for now)
 	peers_tried:  int,
 	peers_live:   int,
 	peers_failed: int,
 	peers_active: int,
 	error:        string,
 	output:       string,
+}
+
+Peer_Detail :: struct {
+	endpoint:  string,
+	client:    string,
+	down_rate: i64,
+}
+
+Torrent_Detail :: struct {
+	id:        Torrent_ID,
+	files:     []metainfo.File_Progress,
+	peers:     []Peer_Detail,
+	down_rate: i64,
+	up_rate:   i64,
 }
 
 @(private)
@@ -54,6 +70,12 @@ Torrent :: struct {
 	status:   Torrent_Status,
 	stop:     bool,
 	thread:   ^thread.Thread,
+	// Detail snapshot — refreshed from peer progress; served only on demand.
+	detail_files: []metainfo.File_Progress,
+	detail_peers: []Peer_Detail,
+	// Live peer sockets so Stop can unblock reads promptly.
+	sock_mu: sync.Mutex,
+	socks:   map[int]net.TCP_Socket,
 }
 
 Engine :: struct {
@@ -236,6 +258,47 @@ engine_list :: proc(e: ^Engine, allocator := context.allocator) -> []Torrent_Sta
 	return out
 }
 
+// engine_details returns file + per-peer stats. Call only when a UI needs them.
+engine_details :: proc(
+	e: ^Engine,
+	id: Torrent_ID,
+	allocator := context.allocator,
+) -> (
+	detail: Torrent_Detail,
+	ok: bool,
+) {
+	if e == nil {
+		return {}, false
+	}
+	sync.lock(&e.mu)
+	t := e.torrents[id] or_else nil
+	sync.unlock(&e.mu)
+	if t == nil {
+		return {}, false
+	}
+	sync.lock(&t.mu)
+	defer sync.unlock(&t.mu)
+	detail.id = t.id
+	detail.down_rate = t.status.down_rate
+	detail.up_rate = t.status.up_rate
+	detail.files = clone_files(t.detail_files, allocator)
+	detail.peers = clone_peers(t.detail_peers, allocator)
+	return detail, true
+}
+
+detail_destroy :: proc(d: ^Torrent_Detail, allocator := context.allocator) {
+	if d == nil {
+		return
+	}
+	metainfo.file_progress_destroy(d.files, allocator)
+	for p in d.peers {
+		delete(p.endpoint, allocator)
+		delete(p.client, allocator)
+	}
+	delete(d.peers, allocator)
+	d^ = {}
+}
+
 engine_stop :: proc(e: ^Engine, id: Torrent_ID) {
 	if e == nil {
 		return
@@ -248,10 +311,14 @@ engine_stop :: proc(e: ^Engine, id: Torrent_ID) {
 	}
 	sync.lock(&t.mu)
 	t.stop = true
-	if t.status.state == .Queued || t.status.state == .Announcing {
+	if t.status.state != .Complete && t.status.state != .Failed {
 		t.status.state = .Stopped
 	}
+	t.status.down_rate = 0
+	t.status.up_rate = 0
+	t.status.peers_active = 0
 	sync.unlock(&t.mu)
+	torrent_interrupt_peers(t)
 }
 
 engine_stop_all :: proc(e: ^Engine) {
@@ -262,7 +329,13 @@ engine_stop_all :: proc(e: ^Engine) {
 	for _, t in e.torrents {
 		sync.lock(&t.mu)
 		t.stop = true
+		if t.status.state != .Complete && t.status.state != .Failed {
+			t.status.state = .Stopped
+		}
+		t.status.down_rate = 0
+		t.status.up_rate = 0
 		sync.unlock(&t.mu)
+		torrent_interrupt_peers(t)
 	}
 	sync.unlock(&e.mu)
 }
@@ -359,6 +432,8 @@ clone_status :: proc(src: Torrent_Status, allocator := context.allocator) -> Tor
 		pieces_total = src.pieces_total,
 		bytes_done   = src.bytes_done,
 		bytes_total  = src.bytes_total,
+		down_rate    = src.down_rate,
+		up_rate      = src.up_rate,
 		peers_tried  = src.peers_tried,
 		peers_live   = src.peers_live,
 		peers_failed = src.peers_failed,
@@ -366,6 +441,50 @@ clone_status :: proc(src: Torrent_Status, allocator := context.allocator) -> Tor
 		error        = strings.clone(src.error, allocator),
 		output       = strings.clone(src.output, allocator),
 	}
+}
+
+@(private)
+clone_files :: proc(src: []metainfo.File_Progress, allocator := context.allocator) -> []metainfo.File_Progress {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]metainfo.File_Progress, len(src), allocator)
+	for f, i in src {
+		out[i] = metainfo.File_Progress{
+			name  = strings.clone(f.name, allocator),
+			done  = f.done,
+			total = f.total,
+		}
+	}
+	return out
+}
+
+@(private)
+clone_peers :: proc(src: []Peer_Detail, allocator := context.allocator) -> []Peer_Detail {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]Peer_Detail, len(src), allocator)
+	for p, i in src {
+		out[i] = Peer_Detail{
+			endpoint  = strings.clone(p.endpoint, allocator),
+			client    = strings.clone(p.client, allocator),
+			down_rate = p.down_rate,
+		}
+	}
+	return out
+}
+
+@(private)
+torrent_clear_detail :: proc(t: ^Torrent) {
+	metainfo.file_progress_destroy(t.detail_files, t.engine.allocator)
+	t.detail_files = nil
+	for p in t.detail_peers {
+		delete(p.endpoint, t.engine.allocator)
+		delete(p.client, t.engine.allocator)
+	}
+	delete(t.detail_peers, t.engine.allocator)
+	t.detail_peers = nil
 }
 
 @(private)
@@ -393,7 +512,49 @@ torrent_free :: proc(t: ^Torrent) {
 	delete(t.status.infohash, alloc)
 	delete(t.status.error, alloc)
 	delete(t.status.output, alloc)
+	torrent_clear_detail(t)
+	delete(t.socks)
 	free(t, alloc)
+}
+
+@(private)
+torrent_interrupt_peers :: proc(t: ^Torrent) {
+	if t == nil {
+		return
+	}
+	sync.lock(&t.sock_mu)
+	for slot, sock in t.socks {
+		if sock != 0 {
+			_ = net.shutdown(sock, .Both)
+			t.socks[slot] = 0
+		}
+	}
+	clear(&t.socks)
+	sync.unlock(&t.sock_mu)
+}
+
+@(private)
+torrent_stop_check :: proc(user: rawptr) -> bool {
+	t := cast(^Torrent)user
+	return torrent_should_stop(t)
+}
+
+@(private)
+torrent_on_sock :: proc(user: rawptr, slot: int, sock: net.TCP_Socket) {
+	t := cast(^Torrent)user
+	if t == nil || slot < 0 {
+		return
+	}
+	sync.lock(&t.sock_mu)
+	if t.socks == nil {
+		t.socks = make(map[int]net.TCP_Socket, t.engine.allocator)
+	}
+	if sock == 0 {
+		delete_key(&t.socks, slot)
+	} else {
+		t.socks[slot] = sock
+	}
+	sync.unlock(&t.sock_mu)
 }
 
 @(private)
@@ -421,7 +582,16 @@ torrent_progress_cb :: proc(p: peer.Progress, user: rawptr) {
 		return
 	}
 	sync.lock(&t.mu)
-	t.status.state = .Downloading
+	stopping := t.stop
+	if stopping {
+		t.status.state = .Stopped
+		t.status.down_rate = 0
+		t.status.up_rate = 0
+	} else {
+		t.status.state = .Downloading
+		t.status.down_rate = p.down_rate
+		t.status.up_rate = 0
+	}
 	t.status.pieces_done = p.pieces_done
 	t.status.pieces_total = p.pieces_total
 	t.status.bytes_done = p.bytes_done
@@ -429,7 +599,25 @@ torrent_progress_cb :: proc(p: peer.Progress, user: rawptr) {
 	t.status.peers_tried = p.peers_tried
 	t.status.peers_live = p.peers_live
 	t.status.peers_failed = p.peers_failed
-	t.status.peers_active = len(p.active)
+	t.status.peers_active = 0 if stopping else len(p.active)
+
+	// Refresh on-demand detail cache (not exposed by list/get unless requested).
+	alloc := t.engine.allocator
+	torrent_clear_detail(t)
+	if len(p.files) > 0 {
+		t.detail_files = clone_files(p.files, alloc)
+	}
+	if !stopping && len(p.active) > 0 {
+		peers := make([]Peer_Detail, len(p.active), alloc)
+		for a, i in p.active {
+			peers[i] = Peer_Detail{
+				endpoint  = strings.clone(a.endpoint, alloc),
+				client    = strings.clone(a.client, alloc),
+				down_rate = a.down_rate,
+			}
+		}
+		t.detail_peers = peers
+	}
 	sync.unlock(&t.mu)
 }
 
@@ -517,20 +705,28 @@ torrent_worker :: proc(th: ^thread.Thread) {
 		e.client.listen_port,
 		torrent_progress_cb,
 		t,
+		torrent_stop_check,
+		torrent_on_sock,
 		alloc,
 	)
 
 	sync.lock(&t.mu)
 	t.status.pieces_done = n
-	if derr.kind != .None {
+	t.status.down_rate = 0
+	t.status.up_rate = 0
+	t.status.peers_active = 0
+	if t.stop {
+		t.status.state = .Stopped
+		if derr.kind != .None && derr.message != "" {
+			delete(derr.message, alloc)
+		}
+	} else if derr.kind != .None {
 		t.status.state = .Failed
 		delete(t.status.error, alloc)
 		t.status.error = strings.clone(peer.error_string(derr), alloc)
 		if derr.message != "" {
 			delete(derr.message, alloc)
 		}
-	} else if t.stop {
-		t.status.state = .Stopped
 	} else {
 		t.status.state = .Complete
 		t.status.pieces_done = t.status.pieces_total
