@@ -42,6 +42,7 @@ Progress :: struct {
 	peers_failed: int,
 	active:       []Active_Peer,
 	files:        []metainfo.File_Progress,
+	have_bits:    []byte, // wire-format bitfield snapshot (valid for callback duration)
 }
 
 Progress_Proc :: #type proc(p: Progress, user: rawptr)
@@ -624,6 +625,8 @@ swarm_emit :: proc(s: ^Swarm, event: Progress_Event, peer_label := "", peer_clie
 	files := metainfo.file_progress(s.info, have_flags, context.temp_allocator)
 	active := swarm_collect_active(s)
 	rate := swarm_down_rate(s)
+	have_bits := make([]byte, len(s.have.bits), context.temp_allocator)
+	copy(have_bits, s.have.bits)
 	p := Progress{
 		event        = event,
 		pieces_done  = done_n,
@@ -638,6 +641,7 @@ swarm_emit :: proc(s: ^Swarm, event: Progress_Event, peer_label := "", peer_clie
 		peers_failed = s.peers_failed,
 		active       = active,
 		files        = files,
+		have_bits    = have_bits,
 	}
 	sync.unlock(&s.mu)
 	s.on_progress(p, s.progress_user)
@@ -908,6 +912,7 @@ download_piece :: proc(
 }
 
 // Download as much as possible from a list of peers in parallel.
+// initial_have is an optional wire-format bitfield of already-complete pieces (resume).
 download_torrent :: proc(
 	endpoints: []net.Endpoint,
 	local: Handshake,
@@ -918,6 +923,7 @@ download_torrent :: proc(
 	progress_user: rawptr = nil,
 	should_stop: Stop_Proc = nil,
 	on_sock: Sock_Proc = nil,
+	initial_have: []byte = nil,
 	allocator := context.allocator,
 ) -> (
 	pieces: int,
@@ -928,16 +934,29 @@ download_torrent :: proc(
 		return 0, peer_fail(.Invalid, "no pieces to download", allocator)
 	}
 
+	have := bitfield_make(total, allocator)
+	if len(initial_have) > 0 {
+		n := min(len(initial_have), len(have.bits))
+		copy(have.bits, initial_have[:n])
+	}
+	got := 0
+	for i in 0 ..< total {
+		if bitfield_has(have, i) {
+			got += 1
+		}
+	}
+
 	workers := max(1, len(endpoints))
 	swarm := Swarm{
 		info              = info,
 		store             = store,
 		local             = local,
 		listen_port       = listen_port,
-		have              = bitfield_make(total, allocator),
+		have              = have,
 		claimed           = bitfield_make(total, allocator),
 		availability      = make([]u16, total, allocator),
 		endpoints         = endpoints,
+		pieces_got        = got,
 		on_progress       = on_progress,
 		progress_user     = progress_user,
 		should_stop       = should_stop,
@@ -967,6 +986,11 @@ download_torrent :: proc(
 		delete(swarm.active_rate_bytes, allocator)
 		delete(swarm.active_rate_tick, allocator)
 		delete(swarm.active_rate, allocator)
+	}
+
+	if swarm_complete(&swarm) {
+		swarm_emit(&swarm, .Piece, "", "")
+		return swarm.pieces_got, {}
 	}
 
 	threads := make([]^thread.Thread, workers, allocator)

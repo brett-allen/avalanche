@@ -65,9 +65,11 @@ Torrent :: struct {
 	engine:   ^Engine,
 	mu:       sync.Mutex,
 	magnet:   metainfo.Magnet,
+	magnet_uri: string, // original / reconstructed magnet for resume
 	meta:     metainfo.Torrent,
 	has_meta: bool,
 	output:   string,
+	have_bits: []byte, // wire-format local bitfield (resume snapshot)
 	status:   Torrent_Status,
 	stop:     bool,
 	thread:   ^thread.Thread,
@@ -80,11 +82,12 @@ Torrent :: struct {
 }
 
 Engine :: struct {
-	client:    Client,
-	mu:        sync.Mutex,
-	torrents:  map[Torrent_ID]^Torrent,
-	next_id:   Torrent_ID,
-	allocator: mem.Allocator,
+	client:       Client,
+	mu:           sync.Mutex,
+	torrents:     map[Torrent_ID]^Torrent,
+	next_id:      Torrent_ID,
+	allocator:    mem.Allocator,
+	download_dir: string, // default output / session index root
 }
 
 engine_make :: proc(port: u16 = DEFAULT_PORT, enable_dht := true, allocator := context.allocator) -> ^Engine {
@@ -93,7 +96,16 @@ engine_make :: proc(port: u16 = DEFAULT_PORT, enable_dht := true, allocator := c
 	e.torrents = make(map[Torrent_ID]^Torrent, allocator)
 	e.next_id = 1
 	e.allocator = allocator
+	e.download_dir = strings.clone("downloads", allocator)
 	return e
+}
+
+engine_set_download_dir :: proc(e: ^Engine, dir: string) {
+	if e == nil {
+		return
+	}
+	delete(e.download_dir, e.allocator)
+	e.download_dir = strings.clone(dir if dir != "" else "downloads", e.allocator)
 }
 
 engine_destroy :: proc(e: ^Engine) {
@@ -101,6 +113,8 @@ engine_destroy :: proc(e: ^Engine) {
 		return
 	}
 	engine_stop_all(e)
+	engine_wait_all(e)
+	engine_persist_flush(e)
 
 	ids: [dynamic]Torrent_ID
 	sync.lock(&e.mu)
@@ -109,11 +123,12 @@ engine_destroy :: proc(e: ^Engine) {
 	}
 	sync.unlock(&e.mu)
 	for id in ids {
-		engine_remove(e, id)
+		engine_remove(e, id, false)
 	}
 	delete(ids)
 
 	delete(e.torrents)
+	delete(e.download_dir, e.allocator)
 	destroy(&e.client)
 	free(e, e.allocator)
 }
@@ -134,7 +149,7 @@ engine_add_magnet :: proc(
 	if aerr.kind != .None {
 		return 0, aerr
 	}
-	return engine_spawn(e, tor, output, allocator)
+	return engine_spawn(e, tor, output, uri, nil, allocator)
 }
 
 engine_add_torrent_file :: proc(
@@ -176,7 +191,60 @@ engine_add_torrent_file :: proc(
 			}
 		}
 	}
-	return engine_spawn(e, tor, output, allocator)
+	magnet_uri := metainfo.magnet_format(tor.magnet, allocator)
+	defer delete(magnet_uri, allocator)
+	return engine_spawn(e, tor, output, magnet_uri, nil, allocator)
+}
+
+// engine_restore_all reloads torrents from {download_dir}/.avalanche/session.json.
+engine_restore_all :: proc(e: ^Engine, download_dir: string, allocator := context.allocator) -> int {
+	if e == nil {
+		return 0
+	}
+	engine_set_download_dir(e, download_dir)
+	entries, ok := persist_load_index(download_dir, allocator)
+	if !ok {
+		return 0
+	}
+	defer persist_index_destroy(entries, allocator)
+
+	n := 0
+	for entry in entries {
+		out := entry.output if entry.output != "" else download_dir
+		session_tor, magnet_uri, have_bits, lok := persist_load_torrent(out, entry.infohash, allocator)
+		if !lok {
+			log.warnf("persist: skip restore %s (missing/corrupt)", entry.infohash)
+			continue
+		}
+		_, err := engine_spawn(e, session_tor, out, magnet_uri, have_bits, allocator)
+		delete(magnet_uri, allocator)
+		delete(have_bits, allocator)
+		if err.kind != .None {
+			log.warnf("persist: restore %s failed: %s", entry.infohash, error_string(err))
+			if err.message != "" {
+				delete(err.message, allocator)
+			}
+			torrent_destroy(&session_tor, allocator)
+			continue
+		}
+		n += 1
+	}
+	if n > 0 {
+		log.infof("persist: restored %d torrent(s) from %s", n, download_dir)
+	}
+	return n
+}
+
+engine_persist_flush :: proc(e: ^Engine) {
+	if e == nil {
+		return
+	}
+	sync.lock(&e.mu)
+	for _, t in e.torrents {
+		persist_save_torrent(t)
+	}
+	sync.unlock(&e.mu)
+	persist_save_index(e, e.download_dir)
 }
 
 @(private)
@@ -184,6 +252,8 @@ engine_spawn :: proc(
 	e: ^Engine,
 	session_tor: Torrent_Session,
 	output: string,
+	magnet_uri: string = "",
+	initial_have: []byte = nil,
 	allocator := context.allocator,
 ) -> (
 	id: Torrent_ID,
@@ -195,7 +265,16 @@ engine_spawn :: proc(
 	t.magnet = session_tor.magnet
 	t.meta = session_tor.meta
 	t.has_meta = session_tor.has_meta
-	t.output = strings.clone(output if output != "" else "downloads", e.allocator)
+	t.output = strings.clone(output if output != "" else e.download_dir, e.allocator)
+	if magnet_uri != "" {
+		t.magnet_uri = strings.clone(magnet_uri, e.allocator)
+	} else {
+		t.magnet_uri = metainfo.magnet_format(t.magnet, e.allocator)
+	}
+	if len(initial_have) > 0 {
+		t.have_bits = make([]byte, len(initial_have), e.allocator)
+		copy(t.have_bits, initial_have)
+	}
 
 	sync.lock(&e.mu)
 	id = e.next_id
@@ -215,6 +294,21 @@ engine_spawn :: proc(
 			delete(t.status.name, e.allocator)
 			t.status.name = strings.clone(t.meta.info.name, e.allocator)
 		}
+		if len(t.have_bits) > 0 {
+			done := 0
+			done_bytes: i64
+			total := t.status.pieces_total
+			for i in 0 ..< total {
+				byte_i := i / 8
+				bit := u8(0x80) >> uint(i % 8)
+				if byte_i < len(t.have_bits) && t.have_bits[byte_i] & bit != 0 {
+					done += 1
+					done_bytes += metainfo.piece_length_at(t.meta.info, i)
+				}
+			}
+			t.status.pieces_done = done
+			t.status.bytes_done = done_bytes
+		}
 	}
 	e.torrents[id] = t
 	sync.unlock(&e.mu)
@@ -224,7 +318,13 @@ engine_spawn :: proc(
 	th.init_context = context
 	t.thread = th
 	thread.start(th)
-	log.infof("torrent %d queued infohash=%s", int(id), t.status.infohash)
+	log.infof("torrent %d queued infohash=%s pieces=%d/%d",
+		int(id), t.status.infohash, t.status.pieces_done, t.status.pieces_total)
+
+	if t.has_meta {
+		persist_save_torrent(t)
+		persist_save_index(e, e.download_dir)
+	}
 	return id, {}
 }
 
@@ -374,7 +474,7 @@ engine_wait_all :: proc(e: ^Engine) {
 	delete(threads)
 }
 
-engine_remove :: proc(e: ^Engine, id: Torrent_ID) {
+engine_remove :: proc(e: ^Engine, id: Torrent_ID, forget_persist := true) {
 	if e == nil {
 		return
 	}
@@ -391,6 +491,10 @@ engine_remove :: proc(e: ^Engine, id: Torrent_ID) {
 		thread.join(t.thread)
 		thread.destroy(t.thread)
 		t.thread = nil
+	}
+	if forget_persist && t.status.infohash != "" {
+		persist_remove_torrent(t.output, t.status.infohash)
+		persist_save_index(e, e.download_dir)
 	}
 	torrent_free(t)
 }
@@ -510,7 +614,9 @@ torrent_free :: proc(t: ^Torrent) {
 	alloc := t.engine.allocator
 	metainfo.magnet_destroy(&t.magnet, alloc)
 	metainfo.destroy(&t.meta, alloc)
+	delete(t.magnet_uri, alloc)
 	delete(t.output, alloc)
+	delete(t.have_bits, alloc)
 	delete(t.status.name, alloc)
 	delete(t.status.infohash, alloc)
 	delete(t.status.error, alloc)
@@ -604,6 +710,14 @@ torrent_progress_cb :: proc(p: peer.Progress, user: rawptr) {
 	t.status.peers_failed = p.peers_failed
 	t.status.peers_active = 0 if stopping else len(p.active)
 
+	if len(p.have_bits) > 0 {
+		if len(t.have_bits) != len(p.have_bits) {
+			delete(t.have_bits, t.engine.allocator)
+			t.have_bits = make([]byte, len(p.have_bits), t.engine.allocator)
+		}
+		copy(t.have_bits, p.have_bits)
+	}
+
 	// Refresh on-demand detail cache (not exposed by list/get unless requested).
 	alloc := t.engine.allocator
 	torrent_clear_detail(t)
@@ -621,7 +735,13 @@ torrent_progress_cb :: proc(p: peer.Progress, user: rawptr) {
 		}
 		t.detail_peers = peers
 	}
+	save_piece := p.event == .Piece
 	sync.unlock(&t.mu)
+
+	// Debounce: flush bitfield on each completed piece (cheap; small files).
+	if save_piece {
+		persist_save_torrent(t)
+	}
 }
 
 @(private)
@@ -632,6 +752,19 @@ torrent_worker :: proc(th: ^thread.Thread) {
 
 	if torrent_should_stop(t) {
 		torrent_set_state(t, .Stopped)
+		persist_save_torrent(t)
+		return
+	}
+
+	// Already complete from resume — no network needed.
+	if t.has_meta && torrent_have_complete(t) {
+		sync.lock(&t.mu)
+		t.status.state = .Complete
+		t.status.pieces_done = t.status.pieces_total
+		t.status.bytes_done = t.status.bytes_total
+		sync.unlock(&t.mu)
+		log.infof("torrent %d: resumed complete (%d pieces)", int(t.id), t.status.pieces_total)
+		persist_save_torrent(t)
 		return
 	}
 
@@ -657,12 +790,14 @@ torrent_worker :: proc(th: ^thread.Thread) {
 
 	if torrent_should_stop(t) {
 		torrent_set_state(t, .Stopped)
+		persist_save_torrent(t)
 		return
 	}
 
 	if len(peers) == 0 && listener == 0 {
 		log.errorf("torrent %d: no peers from trackers or DHT", int(t.id))
 		torrent_set_state(t, .Failed, "no peers from trackers or DHT")
+		persist_save_torrent(t)
 		return
 	}
 
@@ -680,6 +815,7 @@ torrent_worker :: proc(th: ^thread.Thread) {
 		log.errorf("torrent %d: %s", int(t.id), msg)
 		torrent_set_state(t, .Failed, msg)
 		delete(msg, alloc)
+		persist_save_torrent(t)
 		return
 	}
 	t.meta = view.meta
@@ -696,8 +832,13 @@ torrent_worker :: proc(th: ^thread.Thread) {
 	}
 	sync.unlock(&t.mu)
 
+	// Persist info.bencode as soon as metadata is known.
+	persist_save_torrent(t)
+	persist_save_index(e, e.download_dir)
+
 	if torrent_should_stop(t) {
 		torrent_set_state(t, .Stopped)
+		persist_save_torrent(t)
 		return
 	}
 
@@ -708,13 +849,14 @@ torrent_worker :: proc(th: ^thread.Thread) {
 			delete(serr.message, alloc)
 		}
 		torrent_set_state(t, .Failed, msg)
+		persist_save_torrent(t)
 		return
 	}
 	defer storage.close(&store, alloc)
 
 	torrent_set_state(t, .Downloading)
-	log.infof("torrent %d: downloading %q (%d pieces)",
-		int(t.id), t.meta.info.name, metainfo.piece_count(t.meta.info))
+	log.infof("torrent %d: downloading %q (%d/%d pieces)",
+		int(t.id), t.meta.info.name, t.status.pieces_done, metainfo.piece_count(t.meta.info))
 
 	local := peer.make_handshake(transmute([20]u8)t.meta.info_hash, e.client.peer_id)
 	endpoints: [dynamic]net.Endpoint
@@ -723,6 +865,7 @@ torrent_worker :: proc(th: ^thread.Thread) {
 		append(&endpoints, p.endpoint)
 	}
 
+	initial_have := t.have_bits
 	n, derr := peer.download_torrent(
 		endpoints[:],
 		local,
@@ -733,6 +876,7 @@ torrent_worker :: proc(th: ^thread.Thread) {
 		t,
 		torrent_stop_check,
 		torrent_on_sock,
+		initial_have,
 		alloc,
 	)
 
@@ -762,4 +906,24 @@ torrent_worker :: proc(th: ^thread.Thread) {
 		log.infof("torrent %d: complete (%d pieces)", int(t.id), t.status.pieces_total)
 	}
 	sync.unlock(&t.mu)
+	persist_save_torrent(t)
+}
+
+@(private)
+torrent_have_complete :: proc(t: ^Torrent) -> bool {
+	if t == nil || !t.has_meta {
+		return false
+	}
+	total := metainfo.piece_count(t.meta.info)
+	if total <= 0 || len(t.have_bits) == 0 {
+		return false
+	}
+	for i in 0 ..< total {
+		byte_i := i / 8
+		bit := u8(0x80) >> uint(i % 8)
+		if byte_i >= len(t.have_bits) || t.have_bits[byte_i] & bit == 0 {
+			return false
+		}
+	}
+	return true
 }

@@ -174,16 +174,18 @@ ensure_metadata :: proc(
 				tried += 1
 				if len(raw) > 0 {
 					info, ih, ierr := metainfo.parse_info(raw, allocator)
-					delete(raw, allocator)
-					peer.peer_session_destroy(&ps, allocator)
 					if ierr.kind == .None && ih == tor.magnet.info_hash {
 						tor.meta.info = info
 						tor.meta.info_hash = ih
+						tor.meta.info_raw = raw // take ownership
 						tor.has_meta = true
+						peer.peer_session_destroy(&ps, allocator)
 						log.infof("metadata: got %d bytes from inbound peer (name=%q)",
 							int(metainfo.total_length(info)), info.name)
 						return {}
 					}
+					delete(raw, allocator)
+					peer.peer_session_destroy(&ps, allocator)
 					if ierr.kind == .None {
 						metainfo.info_destroy(&info, allocator)
 					}
@@ -267,18 +269,20 @@ ensure_metadata :: proc(
 			continue
 		}
 		info, ih, ierr := metainfo.parse_info(raw, allocator)
-		delete(raw, allocator)
 		if ierr.kind != .None {
+			delete(raw, allocator)
 			log.debugf("metadata: parse failed from %s", ep_s)
 			continue
 		}
 		if ih != tor.magnet.info_hash {
+			delete(raw, allocator)
 			metainfo.info_destroy(&info, allocator)
 			log.warnf("metadata: infohash mismatch from %s", ep_s)
 			continue
 		}
 		tor.meta.info = info
 		tor.meta.info_hash = ih
+		tor.meta.info_raw = raw // take ownership
 		tor.has_meta = true
 		log.infof("metadata: got info name=%q length=%d from %s",
 			info.name, metainfo.total_length(info), ep_s)
@@ -340,6 +344,7 @@ download :: proc(
 		client.listen_port,
 		on_progress,
 		progress_user,
+		nil,
 		nil,
 		nil,
 		allocator,
