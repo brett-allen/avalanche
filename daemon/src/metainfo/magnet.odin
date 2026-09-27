@@ -116,6 +116,37 @@ info_hash_hex :: proc(hash: Info_Hash, allocator := context.allocator) -> string
 	return string(encoded)
 }
 
+// magnet_format rebuilds a magnet URI from structured fields (for session resume).
+magnet_format :: proc(m: Magnet, allocator := context.allocator) -> string {
+	b: strings.Builder
+	strings.builder_init(&b, allocator)
+	defer strings.builder_destroy(&b)
+
+	strings.write_string(&b, "magnet:?xt=urn:btih:")
+	strings.write_string(&b, info_hash_hex(m.info_hash, context.temp_allocator))
+	if m.display != "" {
+		strings.write_string(&b, "&dn=")
+		strings.write_string(&b, net.percent_encode(m.display, context.temp_allocator))
+	}
+	if m.exact_length > 0 {
+		strings.write_string(&b, "&xl=")
+		strings.write_i64(&b, m.exact_length)
+	}
+	for tr in m.trackers {
+		strings.write_string(&b, "&tr=")
+		strings.write_string(&b, net.percent_encode(tr, context.temp_allocator))
+	}
+	for ws in m.webseeds {
+		strings.write_string(&b, "&ws=")
+		strings.write_string(&b, net.percent_encode(ws, context.temp_allocator))
+	}
+	for src in m.sources {
+		strings.write_string(&b, "&xs=")
+		strings.write_string(&b, net.percent_encode(src, context.temp_allocator))
+	}
+	return strings.clone(strings.to_string(b), allocator)
+}
+
 @(private)
 decode_query_component :: proc(s: string, allocator := context.allocator) -> (decoded: string, ok: bool) {
 	replaced, was_alloc := strings.replace_all(s, "+", " ", context.temp_allocator)

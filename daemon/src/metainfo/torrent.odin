@@ -32,6 +32,7 @@ Torrent :: struct {
 	creation_date: i64,
 	info:          Info,
 	info_hash:     Info_Hash,
+	info_raw:      []byte, // exact bencoded info dict (for resume / re-hash)
 }
 
 parse_torrent :: proc(data: []byte, allocator := context.allocator) -> (torrent: Torrent, err: Error) {
@@ -64,6 +65,8 @@ parse_torrent :: proc(data: []byte, allocator := context.allocator) -> (torrent:
 		return {}, Error{kind = .Invalid, message = "torrent missing info bytes"}
 	}
 	hash.hash(.Insecure_SHA1, raw_info, torrent.info_hash[:])
+	torrent.info_raw = make([]byte, len(raw_info), allocator)
+	copy(torrent.info_raw, raw_info)
 
 	torrent.announce, _ = clone_dict_string(dict, "announce", allocator)
 	torrent.comment, _ = clone_dict_string(dict, "comment", allocator)
@@ -134,6 +137,7 @@ destroy :: proc(torrent: ^Torrent, allocator := context.allocator) {
 	delete(torrent.announce_list, allocator)
 	delete(torrent.comment, allocator)
 	delete(torrent.created_by, allocator)
+	delete(torrent.info_raw, allocator)
 	info_destroy(&torrent.info, allocator)
 	torrent^ = {}
 }

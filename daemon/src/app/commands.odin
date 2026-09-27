@@ -178,6 +178,7 @@ run_download :: proc(opt: Options, rt: Runtime) {
 	out := rt.download_dir
 	eng := session.engine_make(rt.listen_port, rt.dht_enabled)
 	defer session.engine_destroy(eng)
+	session.engine_set_download_dir(eng, out)
 
 	ids: [dynamic]session.Torrent_ID
 	defer delete(ids)

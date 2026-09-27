@@ -43,6 +43,8 @@ Optional JSON config (see `avalanche.example.json`). Defaults to `./avalanche.js
 ./avalanched --no-dht
 ```
 
+Session state is saved under `{download_dir}/.avalanche/` (magnet, info bencode, bitfield) so the daemon can resume after restart without re-fetching metadata or re-downloading completed pieces. `DELETE /api/torrents/:id` forgets resume state for that torrent (payload files are left on disk).
+
 | Method | Path | Body |
 |---|---|---|
 | `GET` | `/health` | |

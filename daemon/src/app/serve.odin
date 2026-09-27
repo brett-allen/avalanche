@@ -10,10 +10,14 @@ run_serve :: proc(opt: Options, rt: Runtime) {
 	eng := session.engine_make(rt.listen_port, rt.dht_enabled)
 	defer session.engine_destroy(eng)
 
+	session.engine_set_download_dir(eng, rt.download_dir)
+	restored := session.engine_restore_all(eng, rt.download_dir)
+	_ = restored
+
 	api_url := fmt.tprintf("http://%s:%d", rt.api_host, int(rt.api_port))
-	log.infof("avalanched starting peer_port=%d api=%s output=%s dht=%v config=%q",
+	log.infof("avalanched starting peer_port=%d api=%s output=%s dht=%v config=%q restored=%d",
 		int(rt.listen_port), api_url, rt.download_dir, rt.dht_enabled,
-		rt.config_path if rt.config_path != "" else "(defaults)")
+		rt.config_path if rt.config_path != "" else "(defaults)", restored)
 
 	fmt.printfln("avalanched")
 	fmt.printfln("  peer listen  %d", int(rt.listen_port))
@@ -22,6 +26,9 @@ run_serve :: proc(opt: Options, rt: Runtime) {
 	fmt.printfln("  dht          %v", rt.dht_enabled)
 	if rt.config_path != "" {
 		fmt.printfln("  config       %s", rt.config_path)
+	}
+	if restored > 0 {
+		fmt.printfln("  restored     %d", restored)
 	}
 	fmt.println()
 	fmt.println("endpoints:")
