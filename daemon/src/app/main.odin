@@ -25,14 +25,19 @@ main :: proc() {
 	setup_logging(opt.verbose)
 	defer log.destroy_console_logger(context.logger)
 
+	rt, rt_ok := resolve_runtime(opt)
+	if !rt_ok {
+		os.exit(1)
+	}
+
 	switch cmd {
 	case .Version:
 		run_version()
 	case .Info:
-		run_info(opt)
+		run_info(opt, rt)
 	case .Download:
-		run_download(opt)
+		run_download(opt, rt)
 	case .Serve:
-		run_serve(opt)
+		run_serve(opt, rt)
 	}
 }

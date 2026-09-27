@@ -87,9 +87,9 @@ Engine :: struct {
 	allocator: mem.Allocator,
 }
 
-engine_make :: proc(port: u16 = DEFAULT_PORT, allocator := context.allocator) -> ^Engine {
+engine_make :: proc(port: u16 = DEFAULT_PORT, enable_dht := true, allocator := context.allocator) -> ^Engine {
 	e := new(Engine, allocator)
-	e.client = client_make(port)
+	e.client = client_make(port, enable_dht)
 	e.torrents = make(map[Torrent_ID]^Torrent, allocator)
 	e.next_id = 1
 	e.allocator = allocator
