@@ -44,19 +44,23 @@ merge_contacts :: proc(dst: ^[dynamic]Contact, src: []Contact, target: Node_ID) 
 }
 
 @(private)
-next_unqueried :: proc(shortlist: []Contact, queried: Queried_Set, n: int) -> []int {
-	idxs: [dynamic]int
-	idxs.allocator = context.temp_allocator
-	for c, i in shortlist {
-		if len(idxs) >= n {
+next_unqueried :: proc(
+	shortlist: []Contact,
+	queried: Queried_Set,
+	n: int,
+	allocator := context.allocator,
+) -> []Contact {
+	out := make([dynamic]Contact, 0, n, allocator)
+	for c in shortlist {
+		if len(out) >= n {
 			break
 		}
 		if queried[contact_key(c)] {
 			continue
 		}
-		append(&idxs, i)
+		append(&out, c)
 	}
-	return idxs[:]
+	return out[:]
 }
 
 iterative_find_node :: proc(node: ^Node, target: Node_ID, allocator := context.allocator) -> []Contact {
@@ -72,12 +76,16 @@ iterative_find_node :: proc(node: ^Node, target: Node_ID, allocator := context.a
 
 	for _ in 0 ..< BOOTSTRAP_ROUNDS {
 		ordered_sort_by_distance(shortlist[:], target)
-		batch := next_unqueried(shortlist[:], queried, ALPHA)
+		batch := next_unqueried(shortlist[:], queried, ALPHA, allocator)
 		if len(batch) == 0 {
+			delete(batch, allocator)
 			break
 		}
-		for idx in batch {
-			c := shortlist[idx]
+		// Query the batch first; only then merge — never index into shortlist
+		// while it's being resized/sorted, and never stash indices on temp.
+		incoming: [dynamic]Contact
+		incoming.allocator = allocator
+		for c in batch {
 			queried[contact_key(c)] = true
 			nodes, err := rpc_find_node(node, c.endpoint, target, allocator)
 			if err.kind != .None {
@@ -87,10 +95,15 @@ iterative_find_node :: proc(node: ^Node, target: Node_ID, allocator := context.a
 				continue
 			}
 			if len(nodes) > 0 {
-				merge_contacts(&shortlist, nodes, target)
+				append(&incoming, ..nodes)
 			}
 			delete(nodes, allocator)
 		}
+		delete(batch, allocator)
+		if len(incoming) > 0 {
+			merge_contacts(&shortlist, incoming[:], target)
+		}
+		delete(incoming)
 	}
 
 	out_n := min(K, len(shortlist))
@@ -136,12 +149,14 @@ iterative_get_peers :: proc(
 
 	for _ in 0 ..< LOOKUP_ROUNDS {
 		ordered_sort_by_distance(shortlist[:], info_hash)
-		batch := next_unqueried(shortlist[:], queried, ALPHA)
+		batch := next_unqueried(shortlist[:], queried, ALPHA, allocator)
 		if len(batch) == 0 {
+			delete(batch, allocator)
 			break
 		}
-		for idx in batch {
-			c := shortlist[idx]
+		incoming: [dynamic]Contact
+		incoming.allocator = allocator
+		for c in batch {
 			queried[contact_key(c)] = true
 
 			p, nodes, token, rerr := rpc_get_peers(node, c.endpoint, info_hash, allocator)
@@ -160,13 +175,18 @@ iterative_get_peers :: proc(
 			}
 			delete(p, allocator)
 			if len(nodes) > 0 {
-				merge_contacts(&shortlist, nodes, info_hash)
+				append(&incoming, ..nodes)
 			}
 			delete(nodes, allocator)
 			if token != "" {
 				append(&hints, Token_Hint{endpoint = c.endpoint, token = token})
 			}
 		}
+		delete(batch, allocator)
+		if len(incoming) > 0 {
+			merge_contacts(&shortlist, incoming[:], info_hash)
+		}
+		delete(incoming)
 		if len(found) >= 48 {
 			break
 		}

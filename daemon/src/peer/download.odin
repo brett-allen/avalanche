@@ -3,6 +3,7 @@
 */
 package peer
 
+import "core:math/rand"
 import "core:mem"
 import "core:net"
 import "core:strings"
@@ -67,6 +68,7 @@ Swarm :: struct {
 	listen_port:       u16,
 	have:              Bitfield,
 	claimed:           Bitfield,
+	availability:      []u16, // how many connected peers advertise each piece
 	endpoints:         []net.Endpoint,
 	next_ep:           int,
 	peers_tried:       int,
@@ -163,8 +165,12 @@ connect_session :: proc(
 	}
 
 	for i in 0 ..< MAX_SKIP_MESSAGES {
-		if ps.got_extended && bitfield_any(ps.bitfield) {
-			break
+		if bitfield_any(ps.bitfield) {
+			// Prefer having the peer bitfield before leeching so rarest-first
+			// has real availability data (not all-zeros → fake sequential).
+			if !has_extension(ps.remote) || ps.got_extended || i >= 4 {
+				break
+			}
 		}
 		if !has_extension(ps.remote) && i > 2 {
 			break
@@ -182,11 +188,6 @@ connect_session :: proc(
 		}
 		apply_wire_message(&ps, msg, allocator)
 		message_destroy(&msg, allocator)
-		if has_extension(ps.remote) && ps.got_extended && !want_metadata {
-			if bitfield_any(ps.bitfield) {
-				break
-			}
-		}
 	}
 
 	if want_metadata && ps.got_extended {
@@ -357,17 +358,123 @@ swarm_claim_piece :: proc(s: ^Swarm, peer_bf: Bitfield) -> (index: int, ok: bool
 	if swarm_complete(s) {
 		return 0, false
 	}
+
+	// Rarest-first: find minimum availability among pieces this peer can serve,
+	// then pick uniformly at random among those (not lowest index — that looks
+	// sequential when talking to complete seeds).
+	peer_known := bitfield_any(peer_bf)
+	best_avail := max(u16)
+	n_best := 0
+
 	for i in 0 ..< s.have.count {
 		if bitfield_has(s.have, i) || bitfield_has(s.claimed, i) {
 			continue
 		}
-		if bitfield_any(peer_bf) && !bitfield_has(peer_bf, i) {
+		if peer_known && !bitfield_has(peer_bf, i) {
 			continue
 		}
-		bitfield_set(&s.claimed, i)
-		return i, true
+		avail := s.availability[i] if i < len(s.availability) else 0
+		if n_best == 0 || avail < best_avail {
+			best_avail = avail
+			n_best = 1
+		} else if avail == best_avail {
+			n_best += 1
+		}
+	}
+	if n_best == 0 {
+		return 0, false
+	}
+
+	pick := 0
+	if n_best > 1 {
+		pick = rand.int_max(n_best)
+	}
+	seen := 0
+	for i in 0 ..< s.have.count {
+		if bitfield_has(s.have, i) || bitfield_has(s.claimed, i) {
+			continue
+		}
+		if peer_known && !bitfield_has(peer_bf, i) {
+			continue
+		}
+		avail := s.availability[i] if i < len(s.availability) else 0
+		if avail != best_avail {
+			continue
+		}
+		if seen == pick {
+			bitfield_set(&s.claimed, i)
+			return i, true
+		}
+		seen += 1
 	}
 	return 0, false
+}
+
+@(private)
+swarm_avail_add :: proc(s: ^Swarm, bf: Bitfield) {
+	if s == nil || !bitfield_any(bf) {
+		return
+	}
+	sync.lock(&s.mu)
+	defer sync.unlock(&s.mu)
+	n := min(bf.count, len(s.availability))
+	for i in 0 ..< n {
+		if bitfield_has(bf, i) {
+			s.availability[i] += 1
+		}
+	}
+}
+
+@(private)
+swarm_avail_remove :: proc(s: ^Swarm, bf: Bitfield) {
+	if s == nil || !bitfield_any(bf) {
+		return
+	}
+	sync.lock(&s.mu)
+	defer sync.unlock(&s.mu)
+	n := min(bf.count, len(s.availability))
+	for i in 0 ..< n {
+		if bitfield_has(bf, i) && s.availability[i] > 0 {
+			s.availability[i] -= 1
+		}
+	}
+}
+
+@(private)
+swarm_avail_note_have :: proc(s: ^Swarm, index: int) {
+	if s == nil || index < 0 || index >= len(s.availability) {
+		return
+	}
+	sync.lock(&s.mu)
+	defer sync.unlock(&s.mu)
+	s.availability[index] += 1
+}
+
+@(private)
+swarm_peer_note_have :: proc(s: ^Swarm, ps: ^Peer_Session, index: int) {
+	if ps == nil || index < 0 {
+		return
+	}
+	if bitfield_has(ps.bitfield, index) {
+		return
+	}
+	bitfield_set(&ps.bitfield, index)
+	swarm_avail_note_have(s, index)
+}
+
+@(private)
+swarm_peer_replace_bitfield :: proc(s: ^Swarm, ps: ^Peer_Session, data: []byte, allocator := context.allocator) {
+	if ps == nil {
+		return
+	}
+	swarm_avail_remove(s, ps.bitfield)
+	count := ps.bitfield.count
+	if count <= 0 {
+		count = len(data) * 8
+	}
+	bitfield_destroy(&ps.bitfield, allocator)
+	ps.bitfield = bitfield_from_bytes(data, count, allocator)
+	swarm_avail_add(s, ps.bitfield)
 }
 
 @(private)
@@ -578,6 +685,7 @@ swarm_worker :: proc(t: ^thread.Thread) {
 		sync.lock(&s.mu)
 		s.peers_live += 1
 		sync.unlock(&s.mu)
+		swarm_avail_add(s, ps.bitfield)
 		swarm_set_active(s, slot, label, client_name, true)
 		swarm_bind_sock(s, slot, ps.sock)
 		swarm_emit(s, .Peer_Live, label, client_name)
@@ -586,6 +694,7 @@ swarm_worker :: proc(t: ^thread.Thread) {
 
 		swarm_bind_sock(s, slot, 0)
 		swarm_set_active(s, slot, "", "", false)
+		swarm_avail_remove(s, ps.bitfield)
 		peer_session_destroy(&ps, allocator)
 		delete(label, allocator)
 
@@ -613,7 +722,7 @@ leech_from_peer :: proc(
 		ps.am_interested = true
 	}
 	if ps.peer_choking {
-		if uerr := wait_unchoke(ps, allocator); uerr.kind != .None {
+		if uerr := wait_unchoke(ps, s, allocator); uerr.kind != .None {
 			return 0, uerr
 		}
 	}
@@ -669,7 +778,7 @@ leech_from_peer :: proc(
 }
 
 @(private)
-wait_unchoke :: proc(ps: ^Peer_Session, allocator := context.allocator) -> Error {
+wait_unchoke :: proc(ps: ^Peer_Session, s: ^Swarm = nil, allocator := context.allocator) -> Error {
 	for _ in 0 ..< DOWNLOAD_MSGS {
 		if !ps.peer_choking {
 			return {}
@@ -685,15 +794,10 @@ wait_unchoke :: proc(ps: ^Peer_Session, allocator := context.allocator) -> Error
 			ps.peer_choking = true
 		case .Have:
 			if index, ok := decode_have(msg.payload); ok {
-				bitfield_set(&ps.bitfield, int(index))
+				swarm_peer_note_have(s, ps, int(index))
 			}
 		case .Bitfield:
-			count := ps.bitfield.count
-			if count <= 0 {
-				count = len(msg.payload) * 8
-			}
-			bitfield_destroy(&ps.bitfield, allocator)
-			ps.bitfield = bitfield_from_bytes(msg.payload, count, allocator)
+			swarm_peer_replace_bitfield(s, ps, msg.payload, allocator)
 		}
 		message_destroy(&msg, allocator)
 		if !ps.peer_choking {
@@ -743,7 +847,7 @@ download_piece :: proc(
 		}
 
 		if ps.peer_choking {
-			if uerr := wait_unchoke(ps, allocator); uerr.kind != .None {
+			if uerr := wait_unchoke(ps, s, allocator); uerr.kind != .None {
 				return uerr
 			}
 			pending = 0
@@ -774,15 +878,10 @@ download_piece :: proc(
 			ps.peer_choking = false
 		case .Have:
 			if idx, ok := decode_have(msg.payload); ok {
-				bitfield_set(&ps.bitfield, int(idx))
+				swarm_peer_note_have(s, ps, int(idx))
 			}
 		case .Bitfield:
-			count := ps.bitfield.count
-			if count <= 0 {
-				count = len(msg.payload) * 8
-			}
-			bitfield_destroy(&ps.bitfield, allocator)
-			ps.bitfield = bitfield_from_bytes(msg.payload, count, allocator)
+			swarm_peer_replace_bitfield(s, ps, msg.payload, allocator)
 		case .Piece:
 			pidx, begin, block, ok := decode_piece(msg.payload)
 			if !ok || pidx != index {
@@ -837,6 +936,7 @@ download_torrent :: proc(
 		listen_port       = listen_port,
 		have              = bitfield_make(total, allocator),
 		claimed           = bitfield_make(total, allocator),
+		availability      = make([]u16, total, allocator),
 		endpoints         = endpoints,
 		on_progress       = on_progress,
 		progress_user     = progress_user,
@@ -854,6 +954,7 @@ download_torrent :: proc(
 	defer {
 		bitfield_destroy(&swarm.have, allocator)
 		bitfield_destroy(&swarm.claimed, allocator)
+		delete(swarm.availability, allocator)
 		for i in 0 ..< swarm.slots {
 			if swarm.active_on[i] {
 				delete(swarm.active[i].endpoint, allocator)
