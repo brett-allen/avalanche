@@ -47,11 +47,15 @@ error_string :: proc(err: Error) -> string {
 	return "session: unknown error"
 }
 
-client_make :: proc(port: u16 = DEFAULT_PORT) -> Client {
+client_make :: proc(port: u16 = DEFAULT_PORT, enable_dht := true) -> Client {
 	listen := port if port != 0 else DEFAULT_PORT
 	client := Client{
 		peer_id     = make_peer_id(),
 		listen_port = listen,
+	}
+	if !enable_dht {
+		log.info("dht: disabled by config")
+		return client
 	}
 	node, derr := dht.node_make(listen)
 	if derr.kind == .None {

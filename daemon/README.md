@@ -26,6 +26,23 @@ Requires [Odin](https://odin-lang.org/) and system libcurl.
 ./avalanched download 'magnet:?xt=urn:btih:…'
 ```
 
+Optional JSON config (see `avalanche.example.json`). Defaults to `./avalanche.json` if present; CLI flags override the file.
+
+```json
+{
+  "listen_port": 6881,
+  "download_dir": "downloads",
+  "api_host": "127.0.0.1",
+  "api_port": 8080,
+  "dht_enabled": true
+}
+```
+
+```sh
+./avalanched --config /etc/avalanche.json
+./avalanched --no-dht
+```
+
 | Method | Path | Body |
 |---|---|---|
 | `GET` | `/health` | |

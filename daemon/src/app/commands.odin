@@ -19,9 +19,9 @@ run_version :: proc() {
 	fmt.printfln("peer-id prefix %s", session.PEER_ID_PREFIX)
 }
 
-run_info :: proc(opt: Options) {
+run_info :: proc(opt: Options, rt: Runtime) {
 	if metainfo.is_magnet(opt.input) {
-		run_info_magnet(opt)
+		run_info_magnet(opt, rt)
 		return
 	}
 
@@ -41,7 +41,7 @@ run_info :: proc(opt: Options) {
 	print_torrent_summary(torrent, opt.verbose)
 }
 
-run_info_magnet :: proc(opt: Options) {
+run_info_magnet :: proc(opt: Options, rt: Runtime) {
 	magnet, err := metainfo.parse_magnet(opt.input)
 	if err.kind != .None {
 		fmt.eprintfln("%s %s", paint(.Err, "error:"), metainfo.error_string(err))
@@ -51,7 +51,7 @@ run_info_magnet :: proc(opt: Options) {
 
 	print_magnet_summary(magnet, opt.verbose)
 
-	client := session.client_make(listen_port(opt))
+	client := session.client_make(rt.listen_port, rt.dht_enabled)
 	defer session.destroy(&client)
 
 	got_meta := false
@@ -168,15 +168,15 @@ run_info_magnet :: proc(opt: Options) {
 	}
 }
 
-run_download :: proc(opt: Options) {
+run_download :: proc(opt: Options, rt: Runtime) {
 	inputs := gather_download_inputs(opt)
 	if len(inputs) == 0 {
 		fmt.eprintfln("%s download requires a magnet URI or .torrent path", paint(.Err, "error:"))
 		os.exit(1)
 	}
 
-	out := opt.output if opt.output != "" else "downloads"
-	eng := session.engine_make(listen_port(opt))
+	out := rt.download_dir
+	eng := session.engine_make(rt.listen_port, rt.dht_enabled)
 	defer session.engine_destroy(eng)
 
 	ids: [dynamic]session.Torrent_ID

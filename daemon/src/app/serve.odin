@@ -2,26 +2,27 @@ package main
 
 import "core:fmt"
 import "core:log"
-import "core:net"
 import "core:os"
 import "avalanche:api"
 import "avalanche:session"
 
-run_serve :: proc(opt: Options) {
-	out := opt.output if opt.output != "" else "downloads"
-	api_port := opt.api_port if opt.api_port != 0 else api.DEFAULT_API_PORT
-	bt_port := listen_port(opt)
-
-	eng := session.engine_make(bt_port)
+run_serve :: proc(opt: Options, rt: Runtime) {
+	eng := session.engine_make(rt.listen_port, rt.dht_enabled)
 	defer session.engine_destroy(eng)
 
-	log.infof("avalanched starting peer_port=%d api_port=%d output=%s dht=%v",
-		int(bt_port), int(api_port), out, eng.client.dht != nil)
+	api_url := fmt.tprintf("http://%s:%d", rt.api_host, int(rt.api_port))
+	log.infof("avalanched starting peer_port=%d api=%s output=%s dht=%v config=%q",
+		int(rt.listen_port), api_url, rt.download_dir, rt.dht_enabled,
+		rt.config_path if rt.config_path != "" else "(defaults)")
 
 	fmt.printfln("avalanched")
-	fmt.printfln("  peer listen  %d", int(bt_port))
-	fmt.printfln("  api          http://127.0.0.1:%d", int(api_port))
-	fmt.printfln("  output       %s", out)
+	fmt.printfln("  peer listen  %d", int(rt.listen_port))
+	fmt.printfln("  api          %s", api_url)
+	fmt.printfln("  output       %s", rt.download_dir)
+	fmt.printfln("  dht          %v", rt.dht_enabled)
+	if rt.config_path != "" {
+		fmt.printfln("  config       %s", rt.config_path)
+	}
 	fmt.println()
 	fmt.println("endpoints:")
 	fmt.println("  GET    /health")
@@ -32,9 +33,9 @@ run_serve :: proc(opt: Options) {
 	fmt.println("  DELETE /api/torrents/:id")
 
 	err := api.listen_and_serve(eng, api.Server_Config{
-		host   = net.IP4_Loopback,
-		port   = api_port,
-		output = out,
+		host   = rt.api_addr,
+		port   = rt.api_port,
+		output = rt.download_dir,
 	})
 	if err != nil {
 		log.errorf("api server stopped: %v", err)

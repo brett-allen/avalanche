@@ -1,0 +1,7 @@
+{
+  "listen_port": 6881,
+  "download_dir": "downloads",
+  "api_host": "127.0.0.1",
+  "api_port": 8080,
+  "dht_enabled": true
+}
